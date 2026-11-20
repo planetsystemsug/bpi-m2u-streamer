@@ -34,7 +34,7 @@
 - **Spotify Connect** device ("BPi-M2U-Streamer") via the official Spotify Soloist client. Any Premium account can control it from the normal Spotify app.
 - **Local library** (mp3/flac) from `/mnt/music_library`, served by MPD and controllable from any MPD client app or `mpc`.
 - **USB amp hotplug**: the audio output follows the USB amplifier when it is plugged in and falls back to onboard audio when it is not. Playback resumes on the new card without manual steps.
-- **Spotify priority**: MPD is paused while Spotify plays and resumes when Spotify stops.
+- **Last one started wins**: starting Spotify pauses MPD (resumed when the Spotify session ends); starting MPD pauses Spotify.
 - **Now-playing display** with album art, progress, a boot splash and a bouncing-logo idle screen.
 - **Self-maintaining**: Soloist builds expire after 90 days, so a weekly timer fetches the latest build.
 
@@ -54,7 +54,7 @@
 
 ```
  Spotify app ──LAN──▶ Soloist ──▶ PulseAudio (system mode) ─┐
-                         │                                   ├─▶ ALSA "default" (dmix) ─▶ USB amp
+                         │                                   ├─▶ ALSA "dmixer" (dmix, 44.1 kHz) ─▶ USB amp
  MPD client ──:6600─▶ MPD ───────────────────────────────────┘        (onboard as fallback)
                          ▲
         streamer-soloist-event (polls Soloist every 2 s: pauses MPD while Spotify plays,
@@ -63,8 +63,8 @@
 
 Two independent players share one ALSA card via `dmix`:
 
-- **MPD** (Debian package) serves `/mnt/music_library`, bound to `0.0.0.0:6600`, and writes directly to ALSA.
-- **Spotify Soloist** (official headless client, arm32 build from the Spotify CDN) makes the box a Spotify Connect device. It runs as user `soloist` and plays through a system-mode PulseAudio server (`streamer-pulseaudio.service`) whose single ALSA sink follows the same `/etc/asound.conf` default that MPD uses.
+- **MPD** (Debian package) serves `/mnt/music_library`, bound to `0.0.0.0:6600`, and writes to the `dmixer` PCM directly (not through PulseAudio, which Debian's ALSA config would otherwise route `default` to).
+- **Spotify Soloist** (official headless client, arm32 build from the Spotify CDN) makes the box a Spotify Connect device. It runs as user `soloist` and plays through a system-mode PulseAudio server (`streamer-pulseaudio.service`) whose single ALSA sink is the same `dmixer` PCM that MPD uses.
 
 ### Audio routing
 
@@ -77,11 +77,20 @@ udev fires one event per sound subdevice in no guaranteed order. The card event 
 - The lock is held only for the short read/write sections, never while waiting for the device, so parallel udev workers do not queue up at boot.
 - A oneshot service runs the same logic in `scan` mode at boot (covers "amp already connected at power-on"). MPD is ordered after it via a drop-in so it never opens a stale default.
 
-The default is a `dmix` soft-mixer wrapped in `plug`, so both players can hold the card open at once. Without it the second player fails with "Device or resource busy". Each card gets its own dmix `ipc_key`, so switching cards never collides with a shared-memory segment left by the previous card's players.
+`dmixer` is a `dmix` soft-mixer (group-shared, `ipc_perm 0660`, so MPD and PulseAudio can both attach), so both players can hold the card open at once. Without it the second player fails with "Device or resource busy". Each card gets its own dmix `ipc_key`, so switching cards never collides with a shared-memory segment left by the previous card's players.
 
-### Spotify priority
+### Sound quality
 
-`streamer-soloist-event` polls `soloist ctl now --json` every 2 s. It pauses MPD when Spotify starts playing and resumes it when Spotify stops or its session ends. It also persists track metadata for the display.
+The USB DAC (SMSL) is a USB 1.1 full-speed, adaptive device: **16-bit, 44.1 or 48 kHz only**. The path is built so the common cases are bit-transparent and everything else is converted once, with a high-quality resampler:
+
+- dmix runs at **44.1 kHz / S16_LE**, native for CD material and Spotify. A single 44.1 kHz/16-bit stream passes through unchanged.
+- Higher rates or depths (e.g. 88.2 kHz/24-bit FLAC) are converted once by MPD's `soxr` "very high" resampler and dithered to 16 bit. About 8% CPU on the A7 at 88.2 kHz.
+- Spotify (44.1 kHz) reaches the same dmix with no resampling; PulseAudio uses `soxr-vhq` should a client ever differ.
+- MPD's volume control is the DAC's hardware `PCM` control (no digital attenuation in software). The audio script sets it to 80% when a card is activated.
+
+### Spotify vs. MPD: last one started wins
+
+`streamer-soloist-event` polls `soloist ctl now --json` every 2 s. It pauses MPD when Spotify starts playing and resumes it when Spotify's session ends. If MPD is started while Spotify plays, it pauses Spotify instead. It also persists track metadata for the display.
 
 ### Soloist updates
 
@@ -91,7 +100,8 @@ Soloist builds expire 90 days after their build date (exit code 10). `streamer-s
 
 | Path | Deployed to | Purpose |
 |---|---|---|
-| `pulse/system.pa` | `/etc/pulse/system.pa` | PulseAudio system-mode config: one ALSA sink (`soloist-sink`) on the asound.conf "default" PCM, plus a local unix socket with anonymous auth |
+| `pulse/system.pa` | `/etc/pulse/system.pa` | PulseAudio system-mode config: one ALSA sink (`soloist-sink`) on the `dmixer` PCM (44.1 kHz S16), plus a local unix socket with anonymous auth |
+| `pulse/daemon.conf` | `/etc/pulse/daemon.conf` | 44.1 kHz default rate, `soxr-vhq` resampler for any client that is not 44.1 kHz |
 | `systemd/streamer-pulseaudio.service` | `/etc/systemd/system/` | Runs PulseAudio in system mode (root, group audio) after the audio-default scan; restarted on card switch |
 | `systemd/soloist.service` | `/etc/systemd/system/` | Runs Soloist as user `soloist`, name "BPi-M2U-Streamer", data dir `/var/lib/soloist`, 1 GB cache, initial volume 80%, WebSocket API on 127.0.0.1:8934; clears the MPD-paused flag on start |
 | `bin/streamer-soloist-event`<br>`systemd/streamer-soloist-event.service` | `/usr/local/bin/`<br>`/etc/systemd/system/` | Spotify priority (pause/resume MPD) and display state file `/var/lib/music-display/spotify.json` |
@@ -99,7 +109,7 @@ Soloist builds expire 90 days after their build date (exit code 10). `streamer-s
 | `bin/streamer-audio-default.sh` | `/usr/local/bin/` | Event-driven (`add <card>` / `remove` / `scan` all do the same): recompute the default card, update `/etc/asound.conf`, restart players once the target is openable |
 | `systemd/streamer-audio-default.service` | `/etc/systemd/system/` | Oneshot at boot, runs the script in `scan` mode after `sound.target` |
 | `udev/99-usb-audio.rules` | `/etc/udev/rules.d/` | Runs the script on sound-card add/remove events |
-| `mpd/mpd.conf` | `/etc/mpd.conf` | Music dir `/mnt/music_library`, bound to 0.0.0.0, explicit ALSA output (avoids sndio auto-detect) |
+| `mpd/mpd.conf` | `/etc/mpd.conf` | Music dir `/mnt/music_library`, bound to 0.0.0.0, `soxr` resampler (very high), ALSA output on `dmixer` fixed at 44100:16:2 with MPD hardware volume (`PCM`) |
 | `systemd/mnt-music-library.mount.d/10-rescan.conf` | `/etc/systemd/system/mnt-music-library.mount.d/` | Runs `mpc update` after every mount of the music library |
 | `systemd/mpd.service.d/10-after-audio-default.conf` | `/etc/systemd/system/mpd.service.d/` | Orders MPD after the audio-default scan |
 | `deploy/deploy_music_display.sh` | run on the box | Installs the now-playing display: Pillow framebuffer app, C RGB565 converter, config, systemd unit, cursor-blink drop-in. Backs up the old install and rolls back if the service does not stay up |
@@ -150,7 +160,7 @@ install -m755 bin/streamer-audio-default.sh /usr/local/bin/
 install -m755 bin/streamer-soloist-event /usr/local/bin/
 install -m755 bin/streamer-soloist-update.sh /usr/local/bin/
 install -d -o soloist -g audio /var/lib/streamer
-cp pulse/system.pa /etc/pulse/system.pa
+cp pulse/system.pa pulse/daemon.conf /etc/pulse/
 cp mpd/mpd.conf /etc/mpd.conf
 cp systemd/*.service systemd/*.timer /etc/systemd/system/
 install -Dm644 systemd/mnt-music-library.mount.d/10-rescan.conf \

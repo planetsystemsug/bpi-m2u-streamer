@@ -1,6 +1,6 @@
-# Streamer box: single ALSA sink that follows the "default" PCM from
+# Streamer box: single ALSA sink that uses the "dmixer" PCM (44.1 kHz dmix) from
 # /etc/asound.conf (managed by streamer-audio-default.sh). Soloist plays
-# through this sink; MPD keeps writing to the same dmix directly via ALSA.
-load-module module-alsa-sink device=default sink_name=soloist-sink
+# through this sink; MPD writes to the same dmix directly via ALSA.
+load-module module-alsa-sink device=dmixer sink_name=soloist-sink rate=44100 format=s16le channels=2
 set-default-sink soloist-sink
 load-module module-native-protocol-unix auth-anonymous=1

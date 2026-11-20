@@ -24,7 +24,14 @@ ACTION="$1"; CARD="${2:-}"; CARD="${CARD#card}"
 exec 9>/run/streamer-audio.lock || exit 0
 
 is_usb_card() { readlink -f "/sys/class/sound/card$1/device" 2>/dev/null | grep -q "usb"; }
-conf_for() { printf 'pcm.dmixer {\n    type dmix\n    ipc_key %d\n    slave {\n        pcm "hw:%s"\n        rate 48000\n        channels 2\n        format S16_LE\n    }\n}\npcm.!default {\n    type plug\n    slave.pcm "dmixer"\n}\nctl.!default {\n    type hw\n    card %s\n}\n' $((5678293 + $1)) "$1" "$1"; }
+# dmix runs at 44100 Hz S16_LE: the DAC supports 44.1/48 kHz 16-bit only, and
+# 44.1 kHz is native for CD material and Spotify, so neither gets resampled.
+# MPD (pcm "dmixer", ctl "streamer") and PulseAudio (pcm "dmixer") talk to the
+# dmix directly; hi-res files are converted once, by MPD's soxr resampler.
+# "default" (plug + a good rate converter) is only for incidental ALSA clients.
+conf_for() { printf 'defaults.pcm.rate_converter "samplerate_best"\npcm.dmixer {\n    type dmix\n    ipc_key %d\n    ipc_perm 0660\n    ipc_gid audio\n    slave {\n        pcm "hw:%s"\n        rate 44100\n        channels 2\n        format S16_LE\n    }\n}\npcm.!default {\n    type plug\n    slave.pcm "dmixer"\n}\nctl.streamer {\n    type hw\n    card %s\n}\nctl.!default {\n    type hw\n    card %s\n}\n' $((5678293 + $1)) "$1" "$1" "$1"; }
+# Without a USB card, fall back to the first (onboard) card so "dmixer" still exists.
+first_card() { for c in /sys/class/sound/card*; do [ -e "$c" ] && { n="${c##*/}"; echo "${n#card}"; return; }; done; }
 usb_card() { for c in /sys/class/sound/card*; do n="${c##*/}"; n="${n#card}"; is_usb_card "$n" && { echo "$n"; return; }; done; }
 
 marker_file=/run/streamer-audio-active
@@ -35,10 +42,11 @@ target="$(usb_card)"
 marker="$(cat "$marker_file" 2>/dev/null)"
 
 cur="$(cat /etc/asound.conf 2>/dev/null)"
-if [ -n "$target" ]; then want="$(conf_for "$target")"; else want=""; fi
+fb="$(first_card)"
+if [ -n "$target" ]; then want="$(conf_for "$target")"; elif [ -n "$fb" ]; then want="$(conf_for "$fb")"; else want=""; fi
 if [ "$cur" != "$want" ]; then
     logger -t streamer-audio "asound.conf: switching to ${target:-onboard}"
-    if [ -n "$target" ]; then conf_for "$target" > /etc/asound.conf; else rm -f /etc/asound.conf; fi
+    if [ -n "$want" ]; then printf '%s\n' "$want" > /etc/asound.conf; else rm -f /etc/asound.conf; fi
 fi
 
 need=0
@@ -52,7 +60,7 @@ flock -u 9
 [ "$need" = 1 ] || exit 0
 ready=1
 i=0
-while [ -n "$target" ] && ! runuser -u mpd -- bash -c "dd if=/dev/zero bs=96 count=2 2>/dev/null | aplay -q -D default -f S16_LE -r 48000 -c 2 && amixer -c $target sget PCM >/dev/null" 2>/dev/null; do
+while [ -n "$target" ] && ! runuser -u mpd -- bash -c "dd if=/dev/zero bs=96 count=2 2>/dev/null | aplay -q -D dmixer -f S16_LE -r 44100 -c 2 && amixer -c $target sget PCM >/dev/null" 2>/dev/null; do
     ready=0
     i=$((i+1))
     [ $i -ge 60 ] && break

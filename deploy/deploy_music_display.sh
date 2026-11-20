@@ -818,6 +818,10 @@ import sys
 p = Path(sys.argv[1])
 cfg = json.loads(p.read_text())
 cfg.setdefault("idle_clear_seconds", 300)
+# Migrate the pre-Soloist key (librespot.json is no longer written by anything).
+legacy = cfg.pop("librespot_state", None)
+if legacy and "spotify_state" not in cfg:
+    cfg["spotify_state"] = "/var/lib/music-display/spotify.json"
 cfg.setdefault("spotify_state", "/var/lib/music-display/spotify.json")
 cfg.setdefault("poll_seconds", 2.0)
 p.write_text(json.dumps(cfg, indent=2) + "\n")

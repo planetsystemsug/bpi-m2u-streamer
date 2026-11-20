@@ -3,8 +3,8 @@
 
 Polls `soloist ctl now --json` (the raw playback_state snapshot) every couple
 of seconds and:
-1) Spotify priority: pause MPD while Spotify plays, resume it when Spotify
-   stops or its session ends (flag file guards against resuming an MPD that
+1) Last one started wins: pause MPD when Spotify starts; pause Spotify when
+   MPD is started while Spotify plays. Resume MPD when Spotify's session ends (flag file guards against resuming an MPD that
    was already paused before Spotify started).
 2) Persist track metadata for the TFT display (/var/lib/music-display/spotify.json),
    rewriting whenever anything changes so pause/stop states are reflected and
@@ -214,10 +214,21 @@ def main():
                 os.makedirs(os.path.dirname(FLAG), exist_ok=True)
                 with open(FLAG, 'a'):
                     pass
-        elif not now_playing and was_playing:
+        elif now_playing and was_playing and mpc_playing():
+            # Last one started wins: the user started MPD while Spotify plays
+            # (the Spotify-start edge above already paused MPD otherwise).
+            run_cmd(['soloist', 'ctl', '-D', DATA_DIR, 'pause'])
+            try:
+                os.unlink(FLAG)
+            except FileNotFoundError:
+                pass
+        elif not now_playing and os.path.exists(FLAG):
+            # Checked on every poll, not only on the playing->not-playing edge:
+            # Spotify usually goes "paused" first and the session only becomes
+            # inactive/idle later (or the user pauses, then closes the device).
             stopped = (not cur['logged_in']) or (not cur['is_active']) \
                 or cur['status'] == 'idle'
-            if stopped and os.path.exists(FLAG):
+            if stopped:
                 try:
                     os.unlink(FLAG)
                 except FileNotFoundError:
