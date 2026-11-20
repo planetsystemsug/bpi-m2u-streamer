@@ -1,0 +1,5 @@
+deploy/backup/
+__pycache__/
+mpd_local.conf
+*.env
+.env

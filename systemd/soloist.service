@@ -1,0 +1,16 @@
+[Unit]
+Description=Spotify Soloist Connect player (BPi-M2U-Streamer)
+After=network-online.target sound.target streamer-audio-default.service streamer-pulseaudio.service
+Wants=network-online.target streamer-pulseaudio.service
+
+[Service]
+User=soloist
+Group=audio
+Environment=PULSE_SERVER=unix:/run/pulse/native
+ExecStartPre=/bin/rm -f /var/lib/streamer/mpd-paused-by-spotify
+ExecStart=/usr/local/bin/soloist -n BPi-M2U-Streamer -D /var/lib/soloist -C /var/cache/soloist -z 1024 -i 80 -w 127.0.0.1:8934
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
