@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""Spotify Soloist state watcher for the Streamer box.
+
+Polls `soloist ctl now --json` (the raw playback_state snapshot) every couple
+of seconds and:
+1) Spotify priority: pause MPD while Spotify plays, resume it when Spotify
+   stops or its session ends (flag file guards against resuming an MPD that
+   was already paused before Spotify started).
+2) Persist track metadata for the TFT display (/var/lib/music-display/spotify.json),
+   rewriting whenever anything changes so pause/stop states are reflected and
+   the progress bar advances while playing.
+
+Polling instead of consuming `soloist ctl trace` keeps this robust: a stalled
+or dropped event stream can no longer leave stale state behind, and every tick
+is an authoritative snapshot from the daemon (exit code 2 = connection failed,
+3 = not logged in / server error).
+"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+DATA_DIR = '/var/lib/soloist'
+STATE_FILE = '/var/lib/music-display/spotify.json'
+FLAG = '/var/lib/streamer/mpd-paused-by-spotify'
+POLL_SECS = 2.0
+
+cur = {
+    'logged_in': False,
+    'is_active': True,
+    'status': 'idle',
+    'item': {},
+    'position_ms': 0.0,
+    'timestamp_ms': 0.0,
+    'speed': 1.0,
+}
+
+
+def run_cmd(args):
+    try:
+        subprocess.run(args, capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+
+def mpc_playing():
+    try:
+        out = subprocess.run(['mpc', 'status'], capture_output=True, text=True, timeout=5).stdout
+        return '[playing]' in out
+    except Exception:
+        return False
+
+
+def spotify_playing():
+    return cur['logged_in'] and cur['is_active'] and cur['status'] in ('playing', 'buffering')
+
+
+def display_state():
+    if not (cur['logged_in'] and cur['is_active']):
+        return 'stop'
+    if cur['status'] in ('playing', 'buffering'):
+        return 'play'
+    if cur['status'] == 'paused':
+        return 'pause'
+    return 'stop'
+
+
+def item_fields():
+    item = cur.get('item') or {}
+    dec = item.get('decorations') or {}
+    ident = dec.get('identity') or {}
+    title = str(ident.get('name', '') or '')
+    creators = []
+    for c in dec.get('creators') or []:
+        try:
+            name = (c['entity']['decorations']['identity'] or {}).get('name', '')
+            if name:
+                creators.append(str(name))
+        except Exception:
+            pass
+    parent = ((dec.get('parent') or {}).get('entity')) or {}
+    album = str((((parent.get('decorations') or {}).get('identity')) or {}).get('name', '') or '')
+    covers = []
+    for c in (dec.get('visual_identity') or {}).get('cover') or []:
+        url = c.get('url') if isinstance(c, dict) else None
+        if url:
+            covers.append(str(url))
+    duration_ms = float(((dec.get('playback') or {}).get('duration_ms')) or 0)
+    return {
+        'track_id': str(item.get('uri', '') or ''),
+        'title': title,
+        'artist': ', '.join(creators),
+        'album': album,
+        'duration': max(0.0, duration_ms / 1000.0),
+        'art_urls': covers,
+    }
+
+
+def apply_position(p):
+    if not isinstance(p, dict):
+        return
+    cur['position_ms'] = float(p.get('position_ms') or 0)
+    ts = p.get('timestamp_ms')
+    if ts:
+        cur['timestamp_ms'] = float(ts)
+    speed = p.get('speed')
+    if speed is not None:
+        cur['speed'] = max(0.0, float(speed))
+
+
+def apply_snapshot(ev):
+    cur['status'] = str(ev.get('status') or 'idle')
+    item = ev.get('item')
+    if isinstance(item, dict) and item:
+        cur['item'] = item
+    elif cur['status'] == 'idle':
+        cur['item'] = {}
+    active = ev.get('is_active')
+    if active is not None:
+        cur['is_active'] = bool(active)
+    apply_position(ev.get('position'))
+
+
+def set_logged_out():
+    cur['logged_in'] = False
+    cur['status'] = 'idle'
+    cur['position_ms'] = 0.0
+    cur['timestamp_ms'] = 0.0
+
+
+def poll():
+    try:
+        r = subprocess.run(
+            ['soloist', 'ctl', '-D', DATA_DIR, 'now', '--json'],
+            capture_output=True, text=True, timeout=5)
+    except Exception:
+        return
+    if r.returncode == 0:
+        try:
+            ev = json.loads(r.stdout)
+        except Exception:
+            return
+        cur['logged_in'] = True
+        apply_snapshot(ev)
+    else:
+        set_logged_out()
+
+
+def build_payload():
+    st = display_state()
+    pos = cur['position_ms'] / 1000.0
+    if st == 'play' and cur['timestamp_ms']:
+        elapsed = (time.time() * 1000.0 - cur['timestamp_ms']) / 1000.0
+        pos += max(0.0, elapsed) * max(0.0, cur['speed'])
+    payload = {
+        'source': 'Spotify',
+        'updated': time.time(),
+        'event': 'playback_state',
+        'state': st,
+        'position': pos if st != 'stop' else 0.0,
+    }
+    payload.update(item_fields())
+    return payload
+
+
+def write_if_changed(payload, force=False):
+    key = json.dumps(
+        {k: v for k, v in payload.items() if k != 'updated'}, sort_keys=True)
+    try:
+        with open(STATE_FILE, encoding='utf-8') as stream:
+            old = json.load(stream)
+        old_key = json.dumps(
+            {k: v for k, v in old.items() if k != 'updated' and k in payload},
+            sort_keys=True)
+    except Exception:
+        old_key = ''
+    if not force and key == old_key:
+        return False
+    os.umask(0o002)
+    d = os.path.dirname(STATE_FILE)
+    try:
+        os.makedirs(d, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(prefix='.soloist-', dir=d)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+                json.dump(payload, stream, ensure_ascii=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temp_name, 0o664)
+            os.replace(temp_name, STATE_FILE)
+        finally:
+            try:
+                os.unlink(temp_name)
+            except FileNotFoundError:
+                pass
+        return True
+    except Exception as exc:
+        print('state write failed: %s' % exc, file=sys.stderr)
+        return False
+
+
+def main():
+    was_playing = False
+    last_write = 0.0
+    while True:
+        poll()
+
+        now_playing = spotify_playing()
+        if now_playing and not was_playing:
+            if mpc_playing():
+                run_cmd(['mpc', 'pause'])
+                os.makedirs(os.path.dirname(FLAG), exist_ok=True)
+                with open(FLAG, 'a'):
+                    pass
+        elif not now_playing and was_playing:
+            stopped = (not cur['logged_in']) or (not cur['is_active']) \
+                or cur['status'] == 'idle'
+            if stopped and os.path.exists(FLAG):
+                try:
+                    os.unlink(FLAG)
+                except FileNotFoundError:
+                    pass
+                run_cmd(['mpc', 'play'])
+        was_playing = now_playing
+
+        payload = build_payload()
+        wrote = write_if_changed(payload)
+        if not wrote and display_state() in ('play', 'pause') \
+                and time.time() - last_write >= 30:
+            wrote = write_if_changed(payload, force=True)
+        if wrote:
+            last_write = time.time()
+        time.sleep(POLL_SECS)
+
+
+if __name__ == '__main__':
+    main()

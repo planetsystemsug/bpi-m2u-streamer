@@ -1,0 +1,1 @@
+SUBSYSTEM=="sound", ACTION=="add|remove", RUN+="/usr/local/bin/streamer-audio-default.sh %E{ACTION} %k"

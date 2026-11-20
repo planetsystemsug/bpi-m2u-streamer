@@ -1,0 +1,12 @@
+[Unit]
+Description=Set USB sound card as default audio output
+After=sound.target systemd-udevd.service
+Wants=sound.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/streamer-audio-default.sh scan
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
