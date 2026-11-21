@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""IR remote control for the Streamer box.
+
+Reads scancodes from the SoC's IR receiver (input device "sunxi-ir"), maps
+them to actions through /etc/streamer-ir.json and applies them to whichever
+player is active, the same way the display's touch button does:
+
+  * Spotify (Soloist) if its session is playing or paused (state file written
+    by streamer-soloist-event),
+  * otherwise MPD.
+
+Learn mode is always on: a scancode that is not in the map is logged to the
+journal as "unmapped scancode 0x...", so a new remote is set up by pressing
+its keys, reading `journalctl -u streamer-ir`, and filling in the map.
+
+Config (/etc/streamer-ir.json):
+  {
+    "protocols": ["nec", "rc-5"],        decoders to enable on the receiver
+    "volume_step": 5,                    percent per vol_up / vol_down press
+    "keys": {"0x45": "play_pause", ...}  scancode -> action
+  }
+Actions: play_pause, play, pause, stop, next, prev, next_artist, prev_artist,
+vol_up, vol_down, mute, source.
+Volume and mute change MPD's software volume (Spotify's volume is not exposed
+here). next_artist / prev_artist jump within MPD's queue to the first track of
+the next / previous artist (next / prev on Spotify). source switches between
+MPD and Spotify.
+"""
+import glob
+import json
+import os
+import struct
+import subprocess
+import sys
+import time
+
+CONFIG = os.environ.get('STREAMER_IR_CONFIG', '/etc/streamer-ir.json')
+SPOTIFY_STATE = '/var/lib/music-display/spotify.json'
+SOLOIST = '/usr/local/bin/soloist'
+SOLOIST_DATA_DIR = '/var/lib/soloist'
+STATE_MAX_AGE = 90.0       # the watcher refreshes the file every 30 s while a session is active
+MUTE_FILE = '/run/streamer-ir-mute'
+REPEAT_ACTIONS = {'vol_up', 'vol_down'}
+REPEAT_GAP = 0.15          # seconds between volume steps while a key is held
+PRESS_GAP = 0.4            # other keys: ignore the same code again within this time
+
+EV_MSC, MSC_SCAN = 4, 4
+EVENT_FMT = '@llHHi'
+EVENT_SIZE = struct.calcsize(EVENT_FMT)
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def load_config():
+    with open(CONFIG) as f:
+        cfg = json.load(f)
+    keys = {}
+    for code, action in (cfg.get('keys') or {}).items():
+        keys[int(str(code), 0)] = str(action)
+    return {
+        'protocols': [str(p) for p in cfg.get('protocols') or ['nec']],
+        'volume_step': int(cfg.get('volume_step', 5)),
+        'keys': keys,
+    }
+
+
+def find_receiver():
+    """Return (rc sysfs dir, /dev/input node) of the sunxi-ir receiver."""
+    for ev in sorted(glob.glob('/sys/class/rc/rc*/input*/event*')):
+        rc_dir = ev.rsplit('/input', 1)[0]
+        return rc_dir, '/dev/input/' + os.path.basename(ev)
+    raise RuntimeError('no rc device found (module sunxi_cir loaded? IR node enabled in the device tree?)')
+
+
+def enable_protocols(rc_dir, protocols):
+    path = rc_dir + '/protocols'
+    for proto in protocols:
+        try:
+            with open(path, 'w') as f:
+                f.write('+' + proto)
+        except OSError as exc:
+            log(f'cannot enable protocol {proto}: {exc}')
+    with open(path) as f:
+        log(f'protocols: {f.read().strip()}')
+
+
+def spotify_active():
+    try:
+        if time.time() - os.path.getmtime(SPOTIFY_STATE) > STATE_MAX_AGE:
+            return False
+        with open(SPOTIFY_STATE) as f:
+            return json.load(f).get('state') in ('play', 'pause')
+    except Exception:
+        return False
+
+
+def run(args):
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=8)
+        out = (r.stdout + r.stderr).strip()[:120]
+        if r.returncode != 0:
+            log(f'{" ".join(args)}: rc={r.returncode} {out}')
+        return r
+    except Exception as exc:
+        log(f'{" ".join(args)} failed: {exc}')
+        return None
+
+
+def mpd_playing():
+    r = run(['mpc', 'status'])
+    return bool(r and '[playing]' in r.stdout)
+
+
+def soloist_playing():
+    try:
+        with open(SPOTIFY_STATE) as f:
+            return json.load(f).get('state') == 'play'
+    except Exception:
+        return False
+
+
+def mpd_volume():
+    r = run(['mpc', 'volume'])
+    try:
+        return int(r.stdout.split(':')[1].strip().rstrip('%'))
+    except Exception:
+        return None
+
+
+def mute_toggle():
+    try:
+        with open(MUTE_FILE) as f:
+            saved = int(f.read())
+        os.unlink(MUTE_FILE)
+        run(['mpc', '-q', 'volume', str(saved)])
+        return
+    except (OSError, ValueError):
+        pass
+    vol = mpd_volume()
+    if vol:
+        with open(MUTE_FILE, 'w') as f:
+            f.write(str(vol))
+        run(['mpc', '-q', 'volume', '0'])
+
+
+def jump_artist(forward):
+    """Jump to the first track of the next / previous artist in MPD's queue."""
+    r = run(['mpc', '-f', '%position%', 'current'])
+    q = run(['mpc', 'playlist', '-f', '%artist%'])
+    if not (r and q and r.stdout.strip().isdigit()):
+        run(['mpc', '-q', 'next' if forward else 'prev'])
+        return
+    artists = q.stdout.split('\n')
+    if artists and artists[-1] == '':
+        artists.pop()
+    cur = int(r.stdout.strip()) - 1
+    if not 0 <= cur < len(artists):
+        return
+    if forward:
+        for i in range(cur + 1, len(artists)):
+            if artists[i] != artists[cur]:
+                run(['mpc', '-q', 'play', str(i + 1)])
+                return
+        run(['mpc', '-q', 'play', '1'])      # wrap to the start of the queue
+    else:
+        i = cur
+        while i > 0 and artists[i - 1] == artists[cur]:
+            i -= 1                           # start of the current artist's block
+        if i == 0:
+            run(['mpc', '-q', 'play', '1'])
+            return
+        j = i - 1
+        while j > 0 and artists[j - 1] == artists[i - 1]:
+            j -= 1
+        run(['mpc', '-q', 'play', str(j + 1)])
+
+
+def switch_source(spotify):
+    ctl = [SOLOIST, 'ctl', '-D', SOLOIST_DATA_DIR]
+    if spotify:
+        run(ctl + ['pause'])
+        run(['mpc', '-q', 'play'])
+    else:
+        # Only give up MPD if Spotify really starts (not logged in -> rc != 0).
+        r = run(ctl + ['play'])
+        if r and r.returncode == 0:
+            run(['mpc', '-q', 'pause'])
+        else:
+            log('source: Spotify not available, staying on MPD')
+
+
+def do_action(action, cfg):
+    spotify = spotify_active()
+    target = 'spotify' if spotify else 'mpd'
+    log(f'action {action} -> {target}')
+
+    if action in ('vol_up', 'vol_down'):
+        step = cfg['volume_step']
+        run(['mpc', '-q', 'volume', f'{"+" if action == "vol_up" else "-"}{step}'])
+        return
+
+    if action == 'mute':
+        mute_toggle()
+        return
+    if action == 'source':
+        switch_source(spotify)
+        return
+    if action in ('next_artist', 'prev_artist') and not spotify:
+        jump_artist(action == 'next_artist')
+        return
+    if action == 'next_artist':
+        action = 'next'
+    elif action == 'prev_artist':
+        action = 'prev'
+
+    if spotify:
+        def ctl(cmd):
+            run([SOLOIST, 'ctl', '-D', SOLOIST_DATA_DIR, cmd])
+        if action == 'play_pause':
+            ctl('pause' if soloist_playing() else 'play')
+        elif action == 'play':
+            ctl('play')
+        elif action in ('pause', 'stop'):
+            ctl('pause')
+        elif action in ('next', 'prev'):
+            ctl(action)
+    else:
+        if action == 'play_pause':
+            run(['mpc', '-q', 'pause' if mpd_playing() else 'play'])
+        elif action == 'play':
+            run(['mpc', '-q', 'play'])
+        elif action == 'pause':
+            run(['mpc', '-q', 'pause'])
+        elif action == 'stop':
+            run(['mpc', '-q', 'stop'])
+        elif action in ('next', 'prev'):
+            run(['mpc', '-q', action])
+    if action not in ('play_pause', 'play', 'pause', 'stop', 'next', 'prev'):
+        log(f'unknown action {action!r}')
+
+
+def main():
+    cfg = load_config()
+    rc_dir, node = find_receiver()
+    enable_protocols(rc_dir, cfg['protocols'])
+    log(f'listening on {node} ({len(cfg["keys"])} keys mapped)')
+
+    last = {}
+    with open(node, 'rb', buffering=0) as dev:
+        while True:
+            data = dev.read(EVENT_SIZE)
+            if len(data) < EVENT_SIZE:
+                raise RuntimeError('input device closed')
+            _sec, _usec, etype, code, value = struct.unpack(EVENT_FMT, data)
+            if etype != EV_MSC or code != MSC_SCAN:
+                continue
+            scan = value & 0xFFFFFFFF
+            action = cfg['keys'].get(scan)
+            if action is None:
+                # Raw protocols put the address in the high bits; also try the bare command byte.
+                action = cfg['keys'].get(scan & 0xFF)
+            now = time.monotonic()
+            gap = REPEAT_GAP if action in REPEAT_ACTIONS else PRESS_GAP
+            if now - last.get(scan, -10.0) < gap:
+                continue
+            last[scan] = now
+            if action is None:
+                log(f'unmapped scancode 0x{scan:x}')
+                continue
+            do_action(action, cfg)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as exc:
+        log(f'fatal: {exc}')
+        sys.exit(1)

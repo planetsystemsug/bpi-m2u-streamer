@@ -26,6 +26,7 @@
 - [Spotify setup](#spotify-setup-one-time-per-controlling-account)
 - [Local music](#local-music)
 - [Display](#display)
+- [Remote control](#remote-control-ir)
 - [Power-off](#power-off)
 - [Operations cheat sheet](#operations-cheat-sheet)
 - [Verified working](#verified-working)
@@ -117,6 +118,7 @@ Soloist builds expire 90 days after their build date (exit code 10). `streamer-s
 | `systemd/mpd.service.d/10-after-audio-default.conf` | `/etc/systemd/system/mpd.service.d/` | Orders MPD after the audio-default scan |
 | `systemd/mpd.service.d/20-volume.conf` | `/etc/systemd/system/mpd.service.d/` | Sets MPD's software volume to 85% on every start (MPD only saves it on a clean shutdown, so it came back at 100% after a power-off) |
 | `overlay/bpi-m2u-ili9486.dts` | `/boot/overlay-user/` (compiled to `.dtbo`) | Device tree overlay for the ILI9486 SPI panel (spi0, rotate 90, `bgr`) and its touch controller (spidev at CS1); enabled with `user_overlays=bpi-m2u-ili9486` in `/boot/armbianEnv.txt` |
+| `bin/streamer-ir`<br>`systemd/streamer-ir.service`<br>`default/streamer-ir.json` | `/usr/local/bin/`<br>`/etc/systemd/system/`<br>`/etc/streamer-ir.json` (kept if present) | IR remote control: scancodes from the SoC's IR receiver to MPD / Spotify actions |
 | `modules-load.d/spidev.conf` | `/etc/modules-load.d/` | Loads `spidev` at boot for the touch controller |
 | `deploy/deploy_music_display.sh` | run on the box | Installs the now-playing display: Pillow framebuffer app, C RGB565 converter, config, systemd unit, cursor-blink drop-in. Backs up the old install and rolls back if the service does not stay up |
 | `deploy/install_bootsplash.sh` | run on the box after the display is deployed | Quiet boot (serial console only), boot splash and its systemd service |
@@ -166,6 +168,8 @@ install -m755 bin/streamer-audio-default.sh /usr/local/bin/
 install -m755 bin/streamer-soloist-event /usr/local/bin/
 install -m755 bin/streamer-soloist-update.sh /usr/local/bin/
 install -m755 bin/streamer-soloist-mdns /usr/local/bin/
+install -m755 bin/streamer-ir /usr/local/bin/
+[ -e /etc/streamer-ir.json ] || install -m644 default/streamer-ir.json /etc/streamer-ir.json
 install -Dm644 systemd/soloist.service.d/10-mdns-lan.conf \
     /etc/systemd/system/soloist.service.d/10-mdns-lan.conf
 install -d -o soloist -g audio /var/lib/streamer
@@ -180,7 +184,7 @@ install -Dm644 systemd/mpd.service.d/10-after-audio-default.conf \
 cp udev/99-usb-audio.rules /etc/udev/rules.d/
 systemctl daemon-reload
 systemctl enable --now mpd avahi-daemon streamer-audio-default \
-    streamer-pulseaudio streamer-soloist-event streamer-soloist-update.timer
+    streamer-pulseaudio streamer-soloist-event streamer-soloist-update.timer streamer-ir
 
 # music dir (must be world-readable)
 mkdir -p /mnt/music_library
@@ -299,6 +303,31 @@ Default config:
 - Redraws happen only when something visible changes (position bucketed per second).
 - `music-display-boot-splash.service` shows the splash (top of this page) while the box boots. `install_bootsplash.sh` also sets a serial-only console, `quiet`, `systemd.show_status=false` and `udev.log_level=0` in `/boot/armbianEnv.txt`, so nothing but the splash appears on the panel.
 - A drop-in disables the console cursor blink on fbcon.
+
+## Remote control (IR)
+
+The SoC's IR receiver (`sunxi-ir`, `/dev/lirc0`) is read by `streamer-ir`. It enables the kernel decoders listed under `protocols`, reads scancodes from the receiver's input device (found by sysfs, not by event number) and maps them to actions through `/etc/streamer-ir.json`:
+
+```json
+{ "protocols": ["nec"], "volume_step": 5,
+  "keys": { "0x45": "play_pause", "0x46": "next" } }
+```
+
+Actions: `play_pause`, `play`, `pause`, `stop`, `next`, `prev`, `next_artist`, `prev_artist`, `vol_up`, `vol_down`, `mute`, `source`. They go to Spotify while a Soloist session is playing or paused (same rule as the touch button), otherwise to MPD. Volume and mute change MPD's software volume only; holding a volume key repeats. `next_artist` / `prev_artist` jump to the first track of the next / previous artist in MPD's queue (plain next / prev on Spotify); `source` switches between MPD and Spotify. A scancode that is not in the map is logged as `unmapped scancode 0x...`, so a new remote is set up by pressing each key and reading `journalctl -fu streamer-ir`. Restart the service after editing the map.
+
+The shipped map (`default/streamer-ir.json`) is for the 10-key remote in use:
+
+| Key | Scancode | Action |
+|---|---|---|
+| left / right | `0x123403` / `0x123405` | `prev` / `next` |
+| up / down | `0x123402` / `0x123406` | `prev_artist` / `next_artist` |
+| play/pause | `0x123404` | `play_pause` |
+| source | `0x123407` | `source` (only leaves MPD if Spotify actually starts) |
+| mute | `0x123409` | `mute` (press again to restore) |
+| volume up / down | `0x12340a` / `0x12340b` | `vol_up` / `vol_down` |
+| power (`0x123401`), fn (`0x123408`) | | unmapped on purpose: IR cannot power the box back on |
+
+On a box that already has `/etc/streamer-ir.json` the installer keeps it, so copy the new default over it by hand when the map changes.
 
 ## Power-off
 

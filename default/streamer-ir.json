@@ -1,0 +1,15 @@
+{
+  "protocols": ["nec", "rc-5", "rc-6", "sony", "jvc", "sanyo", "sharp"],
+  "volume_step": 5,
+  "keys": {
+    "0x123402": "prev_artist",
+    "0x123406": "next_artist",
+    "0x123407": "source",
+    "0x123403": "prev",
+    "0x123404": "play_pause",
+    "0x123405": "next",
+    "0x123409": "mute",
+    "0x12340a": "vol_up",
+    "0x12340b": "vol_down"
+  }
+}

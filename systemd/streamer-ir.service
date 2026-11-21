@@ -1,0 +1,11 @@
+[Unit]
+Description=IR remote control (scancodes to MPD / Spotify actions)
+After=mpd.service soloist.service
+
+[Service]
+ExecStart=/usr/local/bin/streamer-ir
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
