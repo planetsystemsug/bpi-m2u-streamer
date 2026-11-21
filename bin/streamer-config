@@ -1,0 +1,1114 @@
+#!/usr/bin/env python3
+"""Setup web server and CLI for the Streamer box.
+
+  streamer-config serve            web UI on port 80 (default), plus the offline watchdog
+  streamer-config info             JSON: addresses, URL, setup PIN, hotspot (used by the display menu)
+  streamer-config audio-list       JSON list of sound cards
+  streamer-config audio-set <id|auto>
+  streamer-config flip-toggle      flip the display by 180 degrees (restarts the display)
+  streamer-config hotspot on|off
+  streamer-config pin [new]        print the setup PIN / generate a new one
+  streamer-config reboot|poweroff
+
+The web UI is protected by a 6-digit PIN that is shown on the display's menu
+(Info) and printed to the journal at start. It is plain HTTP for the LAN, so the
+PIN and the Spotify API key travel unencrypted inside the local network: do not
+expose the port to the internet.
+
+If the box has no usable network for a while it opens a Wi-Fi setup hotspot
+(needs `hostapd` and a Wi-Fi interface that can do AP mode), so a fresh box can
+be set up from a phone without a working remote or a cable.
+
+Config (/etc/streamer-config.json, all keys optional):
+  { "port": 80, "auto_hotspot": true, "hotspot_ssid": "BPi-M2U-Setup",
+    "offline_seconds": 90, "hotspot_idle_seconds": 600 }
+
+STREAMER_CONFIG_DRYRUN=1 runs everything against fixtures and changes nothing
+(for development on another machine).
+"""
+import hashlib
+import hmac
+import http.server
+import ipaddress
+import json
+import os
+import re
+import secrets
+import shutil
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+from http import HTTPStatus
+from pathlib import Path
+
+DRY = os.environ.get('STREAMER_CONFIG_DRYRUN') == '1'
+STATE_DIR = Path(os.environ.get('STREAMER_CONFIG_STATE', '/var/lib/streamer-config'))
+CONFIG_FILE = Path(os.environ.get('STREAMER_CONFIG_FILE', '/etc/streamer-config.json'))
+WEB_DIRS = [Path('/usr/local/share/streamer-config'), Path(__file__).resolve().parent.parent / 'web']
+AUDIO_DEFAULTS = Path(os.environ.get('STREAMER_AUDIO_DEFAULTS', '/etc/default/streamer-audio'))
+DISPLAY_CONFIG = Path(os.environ.get('STREAMER_DISPLAY_CONFIG', '/etc/music-display/config.json'))
+IR_CONFIG = Path(os.environ.get('STREAMER_IR_CONFIG', '/etc/streamer-ir.json'))
+IR_SEEN = Path('/run/streamer-ir-seen.json')
+NETPLAN_FILE = Path(os.environ.get('STREAMER_NETPLAN_FILE', '/etc/netplan/50-streamer.yaml'))
+SOLOIST = '/usr/local/bin/soloist'
+SOLOIST_DATA = '/var/lib/soloist'
+SOLOIST_NAME_FILE = Path(os.environ.get('STREAMER_SOLOIST_ENV', '/etc/default/streamer-soloist'))
+HOTSPOT_NET = Path('/run/systemd/network/05-streamer-hotspot.network')
+HOTSPOT_CONF = Path('/run/streamer-hostapd.conf')
+HOTSPOT_UNIT = 'streamer-hotspot'
+HOTSPOT_IP = '192.168.4.1'
+AUDIO_SCRIPT = '/usr/local/bin/streamer-audio-default.sh'
+
+SERVICES = ['mpd', 'soloist', 'music-display', 'streamer-ir', 'streamer-pulseaudio',
+            'streamer-soloist-event', 'avahi-daemon', 'streamer-config']
+IR_ACTIONS = ['play_pause', 'play', 'pause', 'stop', 'next', 'prev', 'next_artist', 'prev_artist',
+              'vol_up', 'vol_down', 'mute', 'source', 'menu']
+
+state_lock = threading.RLock()
+activity = {'t': time.time()}
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+# --- helpers ---------------------------------------------------------------
+
+def sh(args, input=None, timeout=20, mutate=False):
+    """Run a command; returns (returncode, combined output). mutate=True is skipped in dry-run."""
+    if DRY and mutate:
+        log('dry-run: ' + ' '.join(args))
+        return 0, 'dry-run'
+    try:
+        r = subprocess.run(args, input=input, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except FileNotFoundError:
+        return 127, f'{args[0]}: not installed'
+    except subprocess.TimeoutExpired:
+        return 124, f'{args[0]}: timed out'
+    except Exception as exc:
+        return 1, str(exc)
+
+
+def background(args, delay=0.0):
+    """Run a command shortly after the HTTP response has gone out."""
+    def go():
+        time.sleep(delay)
+        sh(args, timeout=120, mutate=True)
+    threading.Thread(target=go, daemon=True).start()
+
+
+def load_json(path, default):
+    try:
+        return json.loads(Path(path).read_text())
+    except Exception:
+        return default
+
+
+def save_json(path, data, mode=0o644):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + '.tmp')
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(data, f, indent=2)
+        f.write('\n')
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def server_config():
+    cfg = {'port': 80, 'auto_hotspot': True, 'hotspot_ssid': 'BPi-M2U-Setup',
+           'offline_seconds': 90, 'hotspot_idle_seconds': 600}
+    cfg.update(load_json(CONFIG_FILE, {}))
+    return cfg
+
+
+class UserError(Exception):
+    """A request problem that is reported to the user as is."""
+
+
+# --- setup PIN ---------------------------------------------------------------
+
+def get_pin(new=False):
+    p = STATE_DIR / 'pin'
+    if not new:
+        try:
+            pin = p.read_text().strip()
+            if re.fullmatch(r'\d{6}', pin):
+                return pin
+        except OSError:
+            pass
+    pin = f'{secrets.randbelow(10**6):06d}'
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        f.write(pin + '\n')
+    return pin
+
+
+# --- network -----------------------------------------------------------------
+
+def ip_json():
+    rc, out = sh(['ip', '-j', '-4', 'addr'])
+    if rc != 0:
+        return []
+    try:
+        return json.loads(out)
+    except ValueError:
+        return []
+
+
+def iface_kind(name):
+    if Path(f'/sys/class/net/{name}/wireless').exists() or Path(f'/sys/class/net/{name}/phy80211').exists():
+        return 'wifi'
+    return 'ethernet'
+
+
+def is_lan_iface(name):
+    return not re.match(r'(lo|wg|tun|tap|docker|veth|br-|virbr|dummy|sit|ifb|p2p)', name)
+
+
+def wifi_iface():
+    if DRY:
+        return 'wlan0'
+    for p in sorted(Path('/sys/class/net').glob('*')):
+        if is_lan_iface(p.name) and iface_kind(p.name) == 'wifi':
+            return p.name
+    return None
+
+
+def wifi_link(iface):
+    rc, out = sh(['iw', 'dev', iface, 'link'])
+    m = re.search(r'SSID: (.+)', out) if rc == 0 else None
+    return m.group(1).strip() if m else None
+
+
+def default_iface():
+    rc, out = sh(['ip', '-j', 'route', 'show', 'default'])
+    try:
+        routes = [r for r in json.loads(out) if is_lan_iface(r.get('dev', ''))]
+        routes.sort(key=lambda r: r.get('metric', 0))
+        return routes[0]['dev'] if routes else None
+    except Exception:
+        return None
+
+
+def net_info():
+    """Interfaces with addresses, without loopback and VPN tunnels."""
+    hotspot = hotspot_active()
+    wif = wifi_iface()
+    out = []
+    for a in ip_json():
+        name = a.get('ifname', '')
+        if not is_lan_iface(name):
+            continue
+        addrs = [i['local'] + '/' + str(i['prefixlen']) for i in a.get('addr_info', [])
+                 if i.get('family') == 'inet' and not i['local'].startswith('169.254.')]
+        kind = iface_kind(name)
+        entry = {'iface': name, 'kind': kind, 'state': a.get('operstate', '').lower(),
+                 'addresses': addrs, 'ssid': None, 'hotspot': bool(hotspot and name == wif)}
+        if kind == 'wifi' and not entry['hotspot']:
+            entry['ssid'] = wifi_link(name)
+        out.append(entry)
+    if DRY and not out:
+        out = [{'iface': 'wlan0', 'kind': 'wifi', 'state': 'up', 'addresses': ['192.168.1.50/24'],
+                'ssid': 'HomeNet', 'hotspot': False},
+               {'iface': 'end0', 'kind': 'ethernet', 'state': 'down', 'addresses': [], 'ssid': None,
+                'hotspot': False}]
+    return out
+
+
+def primary_ip():
+    nets = net_info()
+    want = default_iface()
+    cand = [n for n in nets if n['addresses']]
+    cand.sort(key=lambda n: (n['iface'] != want, n['kind'] != 'ethernet'))
+    return cand[0]['addresses'][0].split('/')[0] if cand else None
+
+
+def is_online():
+    """A usable address on a LAN interface that is not the setup hotspot."""
+    return any(n['addresses'] and not n['hotspot'] and n['state'] in ('up', 'unknown')
+               for n in net_info())
+
+
+def parse_iw_scan(text):
+    nets = {}
+    for block in re.split(r'(?m)^BSS ', text)[1:]:
+        ssid_m = re.search(r'^\s*SSID: (.*)$', block, re.M)
+        sig_m = re.search(r'signal: (-?[\d.]+) dBm', block)
+        if not ssid_m or not sig_m:
+            continue
+        ssid = ssid_m.group(1).encode().decode('unicode_escape', 'ignore') if '\\x' in ssid_m.group(1) \
+            else ssid_m.group(1)
+        if not ssid.strip() or '\x00' in ssid:
+            continue
+        sig = float(sig_m.group(1))
+        secure = bool(re.search(r'^\s*(RSN|WPA):', block, re.M)) or 'Privacy' in block
+        if ssid not in nets or sig > nets[ssid]['signal']:
+            nets[ssid] = {'ssid': ssid, 'signal': sig, 'secure': secure}
+    return sorted(nets.values(), key=lambda n: -n['signal'])
+
+
+def wifi_scan():
+    if DRY:
+        return [{'ssid': 'HomeNet', 'signal': -48.0, 'secure': True},
+                {'ssid': 'Neighbour', 'signal': -71.0, 'secure': True},
+                {'ssid': 'CafeOpen', 'signal': -80.0, 'secure': False}]
+    if hotspot_active():
+        raise UserError('Scanning is not possible while the setup hotspot is running. '
+                        'Enter the network name by hand, or stop the hotspot first.')
+    iface = wifi_iface()
+    if not iface:
+        raise UserError('No Wi-Fi interface found.')
+    rc, out = sh(['iw', 'dev', iface, 'scan'], timeout=25)
+    if rc != 0:
+        sh(['ip', 'link', 'set', iface, 'up'])
+        time.sleep(1)
+        rc, out = sh(['iw', 'dev', iface, 'scan'], timeout=25)
+    if rc != 0:
+        raise UserError('Scan failed: ' + out[:200])
+    return parse_iw_scan(out)
+
+
+NET_FILE = STATE_DIR / 'network.json'   # saved Wi-Fi networks and static addresses
+
+
+def net_settings():
+    d = load_json(NET_FILE, {})
+    d.setdefault('wifis', [])
+    d.setdefault('ip', {})
+    return d
+
+
+def render_netplan(d):
+    """Write /etc/netplan/50-streamer.yaml (JSON is valid YAML) from the saved settings."""
+    net = {'version': 2}
+
+    def static_fields(s):
+        f = {'dhcp4': False, 'addresses': [s['address']]}
+        if s.get('gateway'):
+            f['routes'] = [{'to': 'default', 'via': s['gateway']}]
+        if s.get('dns'):
+            f['nameservers'] = {'addresses': s['dns']}
+        return f
+
+    wif = wifi_iface() or 'wlan0'
+    wifi = {}
+    if d['wifis']:
+        aps = {}
+        for w in d['wifis']:
+            ap = {}
+            if w.get('password'):
+                ap['auth'] = {'key-management': 'psk', 'password': w['password']}
+            if w.get('hidden'):
+                ap['hidden'] = True
+            aps[w['ssid']] = ap
+        wifi['access-points'] = aps
+    if d['ip'].get('wifi', {}).get('mode') == 'static':
+        wifi.update(static_fields(d['ip']['wifi']))
+    if wifi:
+        wifi.setdefault('dhcp4', True)
+        net['wifis'] = {wif: wifi}
+    eth = d['ip'].get('ethernet', {})
+    if eth.get('mode') == 'static':
+        # Same id as Armbian's catch-all Ethernet entry, so this overrides its DHCP setting.
+        net['ethernets'] = {'all-eth-interfaces': {'match': {'name': 'e*'}, **static_fields(eth)}}
+
+    if len(net) == 1:
+        if NETPLAN_FILE.exists() and not DRY:
+            NETPLAN_FILE.unlink()
+        return
+    if DRY:
+        log('dry-run: netplan file would be:\n' + re.sub(r'("password": )"[^"]*"', r'\1"***"',
+                                                        json.dumps({'network': net}, indent=2)))
+        return
+    NETPLAN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(NETPLAN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump({'network': net}, f, indent=2)
+        f.write('\n')
+    os.chmod(NETPLAN_FILE, 0o600)
+
+
+def apply_network(d, old=None):
+    """Regenerate the netplan file, validate it, apply it after the response is out."""
+    backup = NETPLAN_FILE.read_bytes() if NETPLAN_FILE.exists() and not DRY else None
+    render_netplan(d)
+    rc, out = sh(['netplan', 'generate'], mutate=True)
+    if rc != 0:
+        # Restore the previous state so a typo cannot break the network at the next boot.
+        if backup is not None:
+            NETPLAN_FILE.write_bytes(backup)
+            os.chmod(NETPLAN_FILE, 0o600)
+        elif NETPLAN_FILE.exists():
+            NETPLAN_FILE.unlink()
+        if old is not None:
+            save_json(NET_FILE, old, 0o600)
+        raise UserError('The network configuration was rejected: ' + re.sub(r'password.*', '', out)[:300])
+    if hotspot_active():
+        hotspot_stop('network settings saved')      # leaves the AP and applies netplan itself
+    else:
+        background(['netplan', 'apply'], delay=1.5)
+
+
+def valid_ssid(s):
+    if not isinstance(s, str) or not 1 <= len(s.encode()) <= 32 or '\n' in s or '\x00' in s:
+        raise UserError('The network name must be 1 to 32 characters.')
+    return s
+
+
+def wifi_connect(ssid, password, hidden):
+    valid_ssid(ssid)
+    password = password or ''
+    if password and not 8 <= len(password) <= 63:
+        raise UserError('A WPA password has 8 to 63 characters (leave it empty for an open network).')
+    if '\n' in password or '\x00' in password:
+        raise UserError('The password contains invalid characters.')
+    with state_lock:
+        old = net_settings()
+        d = json.loads(json.dumps(old))
+        d['wifis'] = [w for w in d['wifis'] if w['ssid'] != ssid]
+        d['wifis'].append({'ssid': ssid, 'password': password, 'hidden': bool(hidden)})
+        save_json(NET_FILE, d, 0o600)
+        apply_network(d, old)
+    return 'Connecting to ' + ssid + '. The box restarts its network now; this page will lose the ' \
+           'connection for a moment. If you cannot reconnect after a minute, check the password.'
+
+
+def wifi_forget(ssid):
+    with state_lock:
+        old = net_settings()
+        d = json.loads(json.dumps(old))
+        d['wifis'] = [w for w in d['wifis'] if w['ssid'] != ssid]
+        save_json(NET_FILE, d, 0o600)
+        apply_network(d, old)
+    return 'Removed ' + ssid + '.'
+
+
+def check_ip_settings(s):
+    if s.get('mode') != 'static':
+        return {'mode': 'dhcp'}
+    try:
+        iface = ipaddress.ip_interface(str(s.get('address', '')).strip())
+        if iface.version != 4 or iface.network.prefixlen >= 31:
+            raise ValueError
+        out = {'mode': 'static', 'address': str(iface)}
+        gw = str(s.get('gateway', '')).strip()
+        if gw:
+            gwa = ipaddress.ip_address(gw)
+            if gwa.version != 4 or gwa not in iface.network:
+                raise UserError('The gateway is not inside the address range.')
+            out['gateway'] = gw
+        dns = [x.strip() for x in str(s.get('dns', '')).replace(',', ' ').split() if x.strip()]
+        out['dns'] = [str(ipaddress.ip_address(x)) for x in dns]
+        return out
+    except UserError:
+        raise
+    except ValueError:
+        raise UserError('Enter the address as IPv4 with prefix, e.g. 192.168.1.50/24, '
+                        'and a valid gateway and DNS server.')
+
+
+def set_ip(kind, settings):
+    if kind not in ('wifi', 'ethernet'):
+        raise UserError('Unknown interface type.')
+    new = check_ip_settings(settings)
+    with state_lock:
+        old = net_settings()
+        d = json.loads(json.dumps(old))
+        d['ip'][kind] = new
+        save_json(NET_FILE, d, 0o600)
+        apply_network(d, old)
+    if new['mode'] == 'static':
+        return f'{kind.capitalize()} set to {new["address"]}. The network restarts now; the page address changes.'
+    return f'{kind.capitalize()} set to DHCP. The network restarts now; look at the display for the new address.'
+
+
+# --- setup hotspot ---------------------------------------------------------------
+
+def hotspot_info():
+    d = load_json(STATE_DIR / 'hotspot.json', {})
+    cfg = server_config()
+    if not d.get('psk'):
+        d = {'psk': secrets.token_hex(5)}
+        save_json(STATE_DIR / 'hotspot.json', d, 0o600)
+    ssid = re.sub(r'[^\x20-\x7e]', '', str(cfg['hotspot_ssid']))[:32] or 'BPi-M2U-Setup'
+    return {'ssid': ssid, 'psk': d['psk'], 'ip': HOTSPOT_IP}
+
+
+_hotspot_dry = {'on': False}
+
+
+def hotspot_active():
+    if DRY:
+        return _hotspot_dry['on']
+    rc, out = sh(['systemctl', 'is-active', HOTSPOT_UNIT])
+    return out.strip() == 'active'
+
+
+def hotspot_start(reason=''):
+    iface = wifi_iface()
+    if not iface:
+        raise UserError('No Wi-Fi interface found.')
+    if not DRY and not shutil.which('hostapd'):
+        raise UserError('hostapd is not installed (apt-get install hostapd).')
+    if hotspot_active():
+        return hotspot_info()
+    h = hotspot_info()
+    log(f'hotspot: starting ({reason or "requested"})')
+    conf = (f'interface={iface}\ndriver=nl80211\nssid={h["ssid"]}\nhw_mode=g\nchannel=6\n'
+            f'country_code={server_config().get("country", "DE")}\nieee80211n=1\nwmm_enabled=1\n'
+            'auth_algs=1\nwpa=2\nwpa_key_mgmt=WPA-PSK\nrsn_pairwise=CCMP\n'
+            f'wpa_passphrase={h["psk"]}\n')
+    net = (f'[Match]\nName={iface}\n\n[Network]\nAddress={HOTSPOT_IP}/24\nDHCPServer=yes\n'
+           f'IPv6AcceptRA=no\n\n[DHCPServer]\nPoolOffset=10\nPoolSize=20\nEmitDNS=no\n')
+    if DRY:
+        _hotspot_dry['on'] = True
+        log('dry-run: hotspot started')
+        return h
+    sh(['systemctl', 'stop', f'netplan-wpa-{iface}.service'])
+    fd = os.open(HOTSPOT_CONF, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        f.write(conf)
+    HOTSPOT_NET.parent.mkdir(parents=True, exist_ok=True)
+    HOTSPOT_NET.write_text(net)
+    sh(['ip', 'addr', 'flush', 'dev', iface])
+    sh(['networkctl', 'reload'])
+    rc, out = sh(['systemd-run', f'--unit={HOTSPOT_UNIT}', '--collect', 'hostapd', str(HOTSPOT_CONF)])
+    time.sleep(3)
+    if rc != 0 or not hotspot_active():
+        hotspot_stop('hostapd failed')
+        raise UserError('The hotspot could not start (the Wi-Fi chip may not support access-point mode): '
+                        + out[:200])
+    sh(['networkctl', 'reconfigure', iface])
+    return h
+
+
+def hotspot_stop(reason=''):
+    log(f'hotspot: stopping ({reason})')
+    if DRY:
+        _hotspot_dry['on'] = False
+        return
+    iface = wifi_iface()
+    sh(['systemctl', 'stop', HOTSPOT_UNIT])
+    for p in (HOTSPOT_NET, HOTSPOT_CONF):
+        try:
+            p.unlink()
+        except OSError:
+            pass
+    sh(['networkctl', 'reload'])
+    if iface:
+        sh(['ip', 'addr', 'flush', 'dev', iface])
+    background(['netplan', 'apply'], delay=0.5)
+
+
+def hotspot_clients():
+    iface = wifi_iface()
+    if DRY or not iface:
+        return 0
+    rc, out = sh(['iw', 'dev', iface, 'station', 'dump'])
+    return len(re.findall(r'^Station ', out, re.M)) if rc == 0 else 0
+
+
+def watchdog():
+    """Open the setup hotspot when the box stays offline; close it when it is no longer needed."""
+    offline_since = None
+    time.sleep(30)
+    while True:
+        try:
+            cfg = server_config()
+            now = time.time()
+            idle = now - activity['t']
+            if hotspot_active():
+                busy = idle < cfg['hotspot_idle_seconds'] or hotspot_clients() > 0
+                wired = any(n['kind'] == 'ethernet' and n['addresses'] for n in net_info())
+                if wired and idle > 300:
+                    hotspot_stop('Ethernet is up and nobody uses the hotspot')
+                    offline_since = now
+                elif not busy:
+                    hotspot_stop('idle, retrying the normal Wi-Fi')
+                    offline_since = now
+            elif is_online():
+                offline_since = None
+            else:
+                offline_since = offline_since or now
+                if (cfg['auto_hotspot'] and wifi_iface()
+                        and now - offline_since > cfg['offline_seconds']):
+                    try:
+                        hotspot_start('no network for %d s' % cfg['offline_seconds'])
+                        activity['t'] = now
+                    except UserError as exc:
+                        log(f'hotspot: {exc}')
+                        offline_since = now + 3600      # do not retry every cycle
+        except Exception as exc:
+            log(f'watchdog: {exc}')
+        time.sleep(10)
+
+
+# --- audio -----------------------------------------------------------------
+
+def audio_defaults():
+    """KEY=value pairs of /etc/default/streamer-audio (comments ignored)."""
+    out = {}
+    try:
+        for line in AUDIO_DEFAULTS.read_text().splitlines():
+            m = re.match(r'\s*([A-Z_]+)=(.*)$', line)
+            if m:
+                out[m.group(1)] = m.group(2).strip().strip('"\'')
+    except OSError:
+        pass
+    return out
+
+
+def write_audio_default(key, value):
+    lines = []
+    try:
+        lines = AUDIO_DEFAULTS.read_text().splitlines()
+    except OSError:
+        pass
+    new = f'{key}="{value}"' if key == 'AUDIO_CARD' else f'{key}={value}'
+    for i, line in enumerate(lines):
+        if re.match(rf'\s*{key}=', line):
+            lines[i] = new
+            break
+    else:
+        lines.append(new)
+    if DRY:
+        log(f'dry-run: {AUDIO_DEFAULTS}: {new}')
+        return
+    AUDIO_DEFAULTS.write_text('\n'.join(lines) + '\n')
+
+
+def audio_cards():
+    if DRY and not Path('/proc/asound/cards').exists():
+        text = (' 0 [Codec          ]: H3_Audio_Codec - H3 Audio Codec\n'
+                ' 1 [audio          ]: USB-Audio - SMSL usb audio\n'
+                ' 2 [sun9ihdmi      ]: sun9i-hdmi - sun9i-hdmi\n')
+    else:
+        try:
+            text = Path('/proc/asound/cards').read_text()
+        except OSError:
+            text = ''
+    cards = []
+    for m in re.finditer(r'^\s*(\d+) \[(\S+)\s*\]: (\S+) - (.*)$', text, re.M):
+        num, cid, driver, name = m.groups()
+        usb = driver.startswith('USB') or 'usb' in readlink(f'/sys/class/sound/card{num}/device')
+        cards.append({'num': int(num), 'id': cid, 'name': name.strip(), 'usb': usb})
+    return cards
+
+
+def readlink(p):
+    try:
+        return os.path.realpath(p)
+    except OSError:
+        return ''
+
+
+def audio_current():
+    try:
+        m = re.search(r'hw:(\d+)', Path('/etc/asound.conf').read_text())
+        return int(m.group(1)) if m else None
+    except OSError:
+        return None
+
+
+def audio_state():
+    d = audio_defaults()
+    chosen = d.get('AUDIO_CARD', '')
+    cards = audio_cards()
+    cur = audio_current()
+    for c in cards:
+        c['active'] = (c['num'] == cur)
+    return {'cards': cards, 'choice': chosen or 'auto', 'pcm_volume': int(d.get('PCM_VOLUME', 60) or 60)}
+
+
+def audio_set(choice, pcm_volume=None):
+    cards = audio_cards()
+    if choice != 'auto' and choice not in [c['id'] for c in cards]:
+        raise UserError('That sound card is not present.')
+    if pcm_volume is not None:
+        try:
+            pcm_volume = int(pcm_volume)
+        except (TypeError, ValueError):
+            raise UserError('The DAC volume must be a number.')
+        if not 0 <= pcm_volume <= 100:
+            raise UserError('The DAC volume is a percentage from 0 to 100.')
+        write_audio_default('PCM_VOLUME', pcm_volume)
+    write_audio_default('AUDIO_CARD', '' if choice == 'auto' else choice)
+    # The script waits for the card to become usable and restarts the players; keep it off the request.
+    subprocess_detached([AUDIO_SCRIPT, 'scan'])
+    return 'Audio output set to ' + ('automatic (USB first)' if choice == 'auto' else choice) + \
+           '. The players restart in a few seconds.'
+
+
+def subprocess_detached(args):
+    if DRY:
+        log('dry-run (detached): ' + ' '.join(args))
+        return
+    subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def audio_test(side='both'):
+    """Play a spoken test sound: left only, right only, or alternating left then right."""
+    if side not in ('left', 'right', 'both'):
+        raise UserError('Unknown test.')
+    for ch in {'left': [1], 'right': [2], 'both': [1, 2]}[side]:
+        rc, out = sh(['runuser', '-u', 'mpd', '--', 'speaker-test', '-D', 'default', '-t', 'wav',
+                      '-c', '2', '-s', str(ch), '-l', '1'], timeout=20, mutate=True)
+        if rc != 0:
+            raise UserError('Test sound failed: ' + out[-200:])
+    return 'Test sound played (' + side + ').'
+
+
+# --- Spotify -----------------------------------------------------------------
+
+def soloist_name():
+    try:
+        m = re.search(r'^SOLOIST_NAME=(\S+)', SOLOIST_NAME_FILE.read_text(), re.M)
+        if m:
+            return m.group(1).strip('"\'')
+    except OSError:
+        pass
+    return 'BPi-M2U-Streamer'
+
+
+def spotify_state():
+    rc, active = sh(['systemctl', 'is-active', 'soloist'])
+    rc2, enabled = sh(['systemctl', 'is-enabled', 'soloist'])
+    try:
+        key_stored = any(Path(SOLOIST_DATA).iterdir())
+    except OSError:
+        key_stored = False
+    return {'active': active == 'active', 'enabled': enabled == 'enabled', 'key_stored': key_stored,
+            'name': soloist_name()}
+
+
+def spotify_set_key(key):
+    key = (key or '').strip()
+    if not re.fullmatch(r'[\x21-\x7e]{16,512}', key):
+        raise UserError('That does not look like an API key (it must be one string without spaces).')
+    if DRY:
+        log('dry-run: soloist setup-api-key (key not logged)')
+        return 'API key stored (dry run).'
+    sh(['systemctl', 'stop', 'soloist'])
+    rc, out = sh(['runuser', '-u', 'soloist', '--', SOLOIST, 'setup-api-key', '-D', SOLOIST_DATA],
+                 input=key + '\n', timeout=30)
+    out = out.replace(key, '***')
+    if rc != 0:
+        raise UserError('Soloist rejected the key: ' + out[:300])
+    rc, out = sh(['systemctl', 'enable', '--now', 'soloist'])
+    if rc != 0:
+        raise UserError('The key is stored, but Soloist did not start: ' + out[:300])
+    return ('API key stored and Soloist started. Open Spotify on a phone in the same network '
+            f'and pick "{soloist_name()}" in the device list.')
+
+
+def spotify_set_name(name):
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,40}', name or ''):
+        raise UserError('Use letters, digits, - and _ only (no spaces), up to 40 characters.')
+    if DRY:
+        log(f'dry-run: SOLOIST_NAME={name}')
+        return 'Name saved (dry run).'
+    SOLOIST_NAME_FILE.write_text(f'SOLOIST_NAME={name}\n')
+    sh(['systemctl', 'try-restart', 'soloist'])
+    return f'The Spotify device is now called "{name}".'
+
+
+# --- display, IR, system ---------------------------------------------------------
+
+def display_state():
+    cfg = load_json(DISPLAY_CONFIG, {})
+    return {'flip': bool(cfg.get('flip', False)), 'idle_clear_seconds': int(cfg.get('idle_clear_seconds', 180))}
+
+
+def display_set(flip=None, idle=None):
+    cfg = load_json(DISPLAY_CONFIG, {})
+    if flip is not None:
+        cfg['flip'] = bool(flip)
+    if idle is not None:
+        try:
+            idle = int(idle)
+        except (TypeError, ValueError):
+            raise UserError('The idle time must be a number of seconds.')
+        if not 0 <= idle <= 86400:
+            raise UserError('The idle time must be between 0 and 86400 seconds.')
+        cfg['idle_clear_seconds'] = idle
+    if DRY:
+        log(f'dry-run: display config {cfg}')
+    else:
+        save_json(DISPLAY_CONFIG, cfg)
+        sh(['systemctl', 'restart', '--no-block', 'music-display'])
+    return 'Display settings saved; the display restarts.'
+
+
+def ir_state():
+    cfg = load_json(IR_CONFIG, {'keys': {}})
+    seen = load_json(IR_SEEN, [])
+    return {'keys': cfg.get('keys', {}), 'seen': seen[-12:], 'actions': IR_ACTIONS}
+
+
+def ir_set(keys):
+    clean = {}
+    for code, action in (keys or {}).items():
+        try:
+            n = int(str(code), 0)
+        except ValueError:
+            raise UserError(f'"{code}" is not a scancode.')
+        if action not in IR_ACTIONS:
+            raise UserError(f'Unknown action "{action}".')
+        clean[f'0x{n:x}'] = action
+    cfg = load_json(IR_CONFIG, {'protocols': ['nec'], 'volume_step': 5})
+    cfg['keys'] = clean
+    if DRY:
+        log(f'dry-run: IR keys {clean}')
+    else:
+        save_json(IR_CONFIG, cfg)
+        sh(['systemctl', 'restart', 'streamer-ir'])
+    return 'Remote control map saved.'
+
+
+def system_state():
+    rc, tz = sh(['timedatectl', 'show', '-p', 'Timezone', '--value'])
+    services = {}
+    for s in SERVICES:
+        rc, out = sh(['systemctl', 'is-active', s])
+        services[s] = out.strip() or 'unknown'
+    rc, up = sh(['uptime', '-p'])
+    return {'hostname': os.uname().nodename, 'timezone': tz if rc == 0 else '', 'services': services,
+            'uptime': up}
+
+
+def set_hostname(name):
+    if not re.fullmatch(r'[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?', name or ''):
+        raise UserError('A host name has letters, digits and - only, and 1 to 63 characters.')
+    rc, out = sh(['hostnamectl', 'set-hostname', name], mutate=True)
+    if rc != 0:
+        raise UserError(out[:200])
+    if not DRY:
+        try:
+            hosts = Path('/etc/hosts').read_text()
+            if re.search(r'(?m)^127\.0\.1\.1\s', hosts):
+                hosts = re.sub(r'(?m)^127\.0\.1\.1\s.*$', f'127.0.1.1\t{name}', hosts)
+                Path('/etc/hosts').write_text(hosts)
+        except OSError:
+            pass
+        sh(['systemctl', 'restart', 'avahi-daemon'])
+    return f'Host name set to {name} (reachable as {name}.local).'
+
+
+def set_timezone(tz):
+    rc, out = sh(['timedatectl', 'list-timezones'])
+    if DRY:
+        out = 'Europe/Berlin\nUTC\n'
+    if tz not in out.split():
+        raise UserError('Unknown time zone.')
+    rc, out = sh(['timedatectl', 'set-timezone', tz], mutate=True)
+    if rc != 0:
+        raise UserError(out[:200])
+    return 'Time zone set to ' + tz + '.'
+
+
+def service_action(service, action):
+    if service not in SERVICES or service == 'streamer-config' or action not in ('restart', 'start', 'stop'):
+        raise UserError('Not allowed.')
+    rc, out = sh(['systemctl', action, service], mutate=True)
+    if rc != 0:
+        raise UserError(out[:200])
+    return f'{service}: {action} done.'
+
+
+def logs(service):
+    if service not in SERVICES:
+        raise UserError('Unknown service.')
+    rc, out = sh(['journalctl', '-u', service, '-n', '80', '--no-pager', '-o', 'short'], timeout=10)
+    return out if not DRY else 'dry-run: no journal'
+
+
+def power(action):
+    if action == 'reboot':
+        sh(['systemctl', 'reboot'], mutate=True)
+    elif action == 'poweroff':
+        sh(['systemctl', 'poweroff'], mutate=True)
+    return 'The box is ' + ('rebooting' if action == 'reboot' else 'shutting down') + '.'
+
+
+def library_rescan():
+    rc, out = sh(['mpc', 'update'], mutate=True)
+    if rc != 0:
+        raise UserError('Rescan failed: ' + out[:200])
+    return 'Library rescan started.'
+
+
+def soloist_update():
+    rc, out = sh(['systemctl', 'start', '--no-block', 'streamer-soloist-update.service'], mutate=True)
+    if rc != 0:
+        raise UserError(out[:200])
+    return 'Soloist update started (it restarts Soloist only when a newer build exists).'
+
+
+def info():
+    ip = primary_ip()
+    hs = hotspot_info() if hotspot_active() else None
+    host = os.uname().nodename
+    port = server_config()['port']
+    suffix = '' if port == 80 else f':{port}'
+    return {'hostname': host, 'ip': ip or (HOTSPOT_IP if hs else None),
+            'url': f'http://{ip or HOTSPOT_IP}{suffix}' if (ip or hs) else None,
+            'mdns': f'http://{host}.local{suffix}', 'pin': get_pin(),
+            'hotspot': hs, 'online': is_online()}
+
+
+def full_state():
+    d = net_settings()
+    saved = [{'ssid': w['ssid'], 'hidden': w.get('hidden', False)} for w in d['wifis']]
+    system_ssids = []
+    try:
+        import yaml
+        for p in sorted(Path('/etc/netplan').glob('*.yaml')):
+            if p == NETPLAN_FILE:
+                continue
+            y = yaml.safe_load(p.read_text()) or {}
+            for w in ((y.get('network') or {}).get('wifis') or {}).values():
+                system_ssids += list((w.get('access-points') or {}).keys())
+    except Exception:
+        pass
+    return {
+        'info': info(), 'net': net_info(), 'wifi_saved': saved,
+        'wifi_system': [s for s in system_ssids if s not in [x['ssid'] for x in saved]],
+        'ip': d['ip'], 'hotspot_available': bool(DRY or shutil.which('hostapd')),
+        'audio': audio_state(), 'spotify': spotify_state(), 'display': display_state(),
+        'ir': ir_state(), 'system': system_state(),
+    }
+
+
+# --- HTTP ---------------------------------------------------------------------
+
+sessions = {}                # token -> expiry
+fails = {}                   # client ip -> (count, locked_until)
+
+
+def web_file(name):
+    for d in WEB_DIRS:
+        p = d / name
+        if p.is_file():
+            return p.read_bytes()
+    return None
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = 'streamer-config'
+    protocol_version = 'HTTP/1.1'
+
+    def log_message(self, fmt, *args):
+        pass                                    # keep request lines (and any secret in them) out of the journal
+
+    def _send(self, code, body, ctype='application/json', headers=None):
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body).encode()
+        elif isinstance(body, str):
+            body = body.encode()
+        self.send_response(code)
+        self.send_header('Content-Type', ctype)
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Content-Security-Policy', "default-src 'self'; style-src 'unsafe-inline' 'self'; "
+                                                    "script-src 'unsafe-inline' 'self'")
+        self.send_header('Referrer-Policy', 'no-referrer')
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _token(self):
+        for part in (self.headers.get('Cookie') or '').split(';'):
+            k, _, v = part.strip().partition('=')
+            if k == 'sid':
+                return v
+        return ''
+
+    def _authed(self):
+        tok = self._token()
+        exp = sessions.get(tok)
+        if exp and exp > time.time():
+            activity['t'] = time.time()
+            return True
+        sessions.pop(tok, None)
+        return False
+
+    def _body(self):
+        n = int(self.headers.get('Content-Length') or 0)
+        if n > 65536:
+            raise UserError('Request too large.')
+        if not n:
+            return {}
+        try:
+            data = json.loads(self.rfile.read(n))
+        except ValueError:
+            raise UserError('Bad request.')
+        return data if isinstance(data, dict) else {}
+
+    def do_GET(self):
+        path = self.path.split('?')[0]
+        if path in ('/', '/index.html'):
+            body = web_file('index.html')
+            if body is None:
+                return self._send(500, 'index.html missing', 'text/plain')
+            return self._send(200, body, 'text/html; charset=utf-8')
+        if path.startswith('/api/'):
+            return self._api('GET', path[5:])
+        self._send(404, {'error': 'not found'})
+
+    def do_POST(self):
+        if self.path.startswith('/api/'):
+            return self._api('POST', self.path[5:].split('?')[0])
+        self._send(404, {'error': 'not found'})
+
+    def _api(self, method, route):
+        try:
+            # Browsers send Origin on cross-site POSTs; refuse anything that is not this host.
+            origin = self.headers.get('Origin')
+            if method == 'POST' and origin and origin.split('://', 1)[-1] != self.headers.get('Host'):
+                raise UserError('Cross-site request refused.')
+            if method == 'POST' and route == 'login':
+                return self._login()
+            if not self._authed():
+                return self._send(401, {'error': 'login required'})
+            if method == 'GET':
+                return self._get(route)
+            return self._post(route, self._body())
+        except UserError as exc:
+            self._send(400, {'error': str(exc)})
+        except Exception as exc:
+            log(f'error in {route}: {type(exc).__name__}: {exc}')
+            self._send(500, {'error': 'Internal error, see the journal.'})
+
+    def _login(self):
+        ip = self.client_address[0]
+        count, locked = fails.get(ip, (0, 0))
+        if locked > time.time():
+            raise UserError('Too many wrong PINs. Wait a minute.')
+        pin = str(self._body().get('pin', ''))
+        if hmac.compare_digest(hashlib.sha256(pin.encode()).digest(),
+                               hashlib.sha256(get_pin().encode()).digest()):
+            fails.pop(ip, None)
+            tok = secrets.token_urlsafe(24)
+            sessions[tok] = time.time() + 12 * 3600
+            activity['t'] = time.time()
+            return self._send(200, {'ok': True},
+                              headers={'Set-Cookie': f'sid={tok}; Path=/; HttpOnly; SameSite=Strict; Max-Age=43200'})
+        count += 1
+        fails[ip] = (count, time.time() + 60 if count % 5 == 0 else 0)
+        time.sleep(1)
+        raise UserError('Wrong PIN. It is shown on the display under Menu > Info.')
+
+    def _get(self, route):
+        if route == 'state':
+            return self._send(200, full_state())
+        if route == 'wifi/scan':
+            return self._send(200, {'networks': wifi_scan()})
+        if route.startswith('logs/'):
+            return self._send(200, {'log': logs(route[5:])})
+        raise UserError('Unknown request.')
+
+    def _post(self, route, b):
+        msg = None
+        if route == 'wifi/connect':
+            msg = wifi_connect(b.get('ssid'), b.get('password'), b.get('hidden'))
+        elif route == 'wifi/forget':
+            msg = wifi_forget(b.get('ssid'))
+        elif route == 'ip':
+            msg = set_ip(b.get('kind'), b)
+        elif route == 'hotspot':
+            if b.get('on'):
+                hotspot_start('requested from the web UI')
+                msg = 'Hotspot is on.'
+            else:
+                hotspot_stop('requested from the web UI')
+                msg = 'Hotspot stopped; the normal network is restored.'
+        elif route == 'audio':
+            msg = audio_set(str(b.get('card', 'auto')), b.get('pcm_volume'))
+        elif route == 'audio/test':
+            msg = audio_test(str(b.get('side', 'both')))
+        elif route == 'spotify/key':
+            msg = spotify_set_key(b.get('key'))
+        elif route == 'spotify/name':
+            msg = spotify_set_name(b.get('name'))
+        elif route == 'display':
+            msg = display_set(b.get('flip'), b.get('idle_clear_seconds'))
+        elif route == 'ir':
+            msg = ir_set(b.get('keys'))
+        elif route == 'hostname':
+            msg = set_hostname(b.get('name'))
+        elif route == 'timezone':
+            msg = set_timezone(b.get('timezone'))
+        elif route == 'service':
+            msg = service_action(b.get('service'), b.get('action'))
+        elif route == 'rescan':
+            msg = library_rescan()
+        elif route == 'soloist/update':
+            msg = soloist_update()
+        elif route == 'pin/new':
+            get_pin(new=True)
+            sessions.clear()
+            return self._send(200, {'ok': True, 'message': 'New PIN generated; see the display. Logged out.'})
+        elif route in ('reboot', 'poweroff'):
+            msg = power(route)
+        else:
+            raise UserError('Unknown request.')
+        self._send(200, {'ok': True, 'message': msg})
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def serve():
+    cfg = server_config()
+    pin = get_pin()
+    log(f'streamer-config: listening on port {cfg["port"]}, setup PIN {pin}' + (' (dry run)' if DRY else ''))
+    threading.Thread(target=watchdog, daemon=True).start()
+    Server(('0.0.0.0', int(cfg['port'])), Handler).serve_forever()
+
+
+def cli(argv):
+    cmd = argv[0] if argv else 'serve'
+    try:
+        if cmd == 'serve':
+            serve()
+        elif cmd == 'info':
+            print(json.dumps(info()))
+        elif cmd == 'audio-list':
+            print(json.dumps(audio_state()))
+        elif cmd == 'audio-set':
+            print(audio_set(argv[1]))
+        elif cmd == 'flip-toggle':
+            print(display_set(flip=not display_state()['flip']))
+        elif cmd == 'hotspot':
+            if argv[1:2] == ['on']:
+                hotspot_start('requested from the CLI')
+            else:
+                hotspot_stop('requested from the CLI')
+        elif cmd == 'pin':
+            print(get_pin(new=argv[1:2] == ['new']))
+        elif cmd in ('reboot', 'poweroff'):
+            print(power(cmd))
+        else:
+            print(__doc__)
+            return 2
+    except UserError as exc:
+        print(f'error: {exc}', file=sys.stderr)
+        return 1
+    except IndexError:
+        print(__doc__)
+        return 2
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(cli(sys.argv[1:]))

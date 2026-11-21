@@ -20,7 +20,12 @@ Config (/etc/streamer-ir.json):
     "keys": {"0x45": "play_pause", ...}  scancode -> action
   }
 Actions: play_pause, play, pause, stop, next, prev, next_artist, prev_artist,
-vol_up, vol_down, mute, source.
+vol_up, vol_down, mute, source, menu.
+"menu" opens the setup menu on the display (music-display). While it is open the
+keys steer the menu instead of the players: prev_artist/next_artist = up/down,
+play_pause/next = OK, prev = back, source/menu = close; volume and mute still work.
+Every scancode seen is also kept in /run/streamer-ir-seen.json, so the setup web
+UI can offer new remotes' keys for mapping.
 Volume and mute change MPD's software volume (Spotify's volume is not exposed
 here). next_artist / prev_artist jump within MPD's queue to the first track of
 the next / previous artist (next / prev on Spotify). source switches between
@@ -40,6 +45,11 @@ SOLOIST = '/usr/local/bin/soloist'
 SOLOIST_DATA_DIR = '/var/lib/soloist'
 STATE_MAX_AGE = 90.0       # the watcher refreshes the file every 30 s while a session is active
 MUTE_FILE = '/run/streamer-ir-mute'
+SEEN_FILE = '/run/streamer-ir-seen.json'
+MENU_FLAG = '/run/music-display-menu'        # exists while the display menu is open
+MENU_SOCKET = '/run/music-display.sock'
+MENU_KEYS = {'prev_artist': 'up', 'next_artist': 'down', 'play_pause': 'ok', 'next': 'ok',
+             'prev': 'back', 'source': 'close', 'menu': 'close', 'stop': 'close'}
 REPEAT_ACTIONS = {'vol_up', 'vol_down'}
 REPEAT_GAP = 0.15          # seconds between volume steps while a key is held
 PRESS_GAP = 0.4            # other keys: ignore the same code again within this time
@@ -84,6 +94,30 @@ def enable_protocols(rc_dir, protocols):
             log(f'cannot enable protocol {proto}: {exc}')
     with open(path) as f:
         log(f'protocols: {f.read().strip()}')
+
+
+def menu_send(cmd):
+    import socket
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.sendto(cmd.encode(), MENU_SOCKET)
+    except OSError as exc:
+        log(f'menu: cannot reach the display: {exc}')
+
+
+def note_seen(scan, action):
+    try:
+        try:
+            with open(SEEN_FILE) as f:
+                seen = json.load(f)
+        except (OSError, ValueError):
+            seen = []
+        seen = [e for e in seen if e.get('code') != f'0x{scan:x}'][-11:]
+        seen.append({'code': f'0x{scan:x}', 'action': action, 'time': int(time.time())})
+        with open(SEEN_FILE, 'w') as f:
+            json.dump(seen, f)
+    except OSError:
+        pass
 
 
 def spotify_active():
@@ -192,6 +226,14 @@ def switch_source(spotify):
 
 
 def do_action(action, cfg):
+    if os.path.exists(MENU_FLAG) and action in MENU_KEYS:
+        log(f'action {action} -> menu')
+        menu_send(MENU_KEYS[action])
+        return
+    if action == 'menu':
+        log('action menu -> open')
+        menu_send('open')
+        return
     spotify = spotify_active()
     target = 'spotify' if spotify else 'mpd'
     log(f'action {action} -> {target}')
@@ -266,6 +308,7 @@ def main():
             if now - last.get(scan, -10.0) < gap:
                 continue
             last[scan] = now
+            note_seen(scan, action)
             if action is None:
                 log(f'unmapped scancode 0x{scan:x}')
                 continue

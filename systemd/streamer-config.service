@@ -1,0 +1,11 @@
+[Unit]
+Description=Streamer setup web server (Wi-Fi, audio, Spotify key, display)
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/streamer-config serve
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

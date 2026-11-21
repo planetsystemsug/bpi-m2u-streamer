@@ -8,6 +8,7 @@
     "0x123403": "prev",
     "0x123404": "play_pause",
     "0x123405": "next",
+    "0x123408": "menu",
     "0x123409": "mute",
     "0x12340a": "vol_up",
     "0x12340b": "vol_down"

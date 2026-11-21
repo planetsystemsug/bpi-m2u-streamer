@@ -7,8 +7,10 @@ Wants=network-online.target streamer-pulseaudio.service
 User=soloist
 Group=audio
 Environment=PULSE_SERVER=unix:/run/pulse/native
+Environment=SOLOIST_NAME=BPi-M2U-Streamer
+EnvironmentFile=-/etc/default/streamer-soloist
 ExecStartPre=/bin/rm -f /var/lib/streamer/mpd-paused-by-spotify
-ExecStart=/usr/local/bin/soloist -n BPi-M2U-Streamer -D /var/lib/soloist -C /var/cache/soloist -z 1024 -i 100 -w 127.0.0.1:8934
+ExecStart=/usr/local/bin/soloist -n ${SOLOIST_NAME} -D /var/lib/soloist -C /var/cache/soloist -z 1024 -i 100 -w 127.0.0.1:8934
 Restart=on-failure
 RestartSec=5
 

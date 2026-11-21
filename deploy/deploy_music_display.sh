@@ -60,7 +60,7 @@ done
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y --no-install-recommends python3 python3-pil fonts-dejavu-core gcc libc6-dev
+apt-get install -y --no-install-recommends python3 python3-pil python3-qrcode fonts-dejavu-core gcc libc6-dev
 
 getent group music-display >/dev/null || groupadd --system music-display
 install -d -m 0755 /opt/music-display /etc/music-display
@@ -121,6 +121,7 @@ import hashlib
 import io
 import json
 import os
+import queue
 import signal
 import socket
 import struct
@@ -195,6 +196,7 @@ class Framebuffer:
         self.fd = os.open(path, os.O_RDWR | os.O_CLOEXEC)
         self.var = ioctl_struct(self.fd, FBIOGET_VSCREENINFO, FbVarScreeninfo)
         self.fix = ioctl_struct(self.fd, FBIOGET_FSCREENINFO, FbFixScreeninfo)
+        self.flip = bool(read_config().get('flip', False))   # False = the panel's mounting rotation (180)
         self.width = int(self.var.xres)
         self.height = int(self.var.yres)
         self.bpp = int(self.var.bits_per_pixel)
@@ -237,7 +239,8 @@ class Framebuffer:
 
     def show(self, image):
         image = image.convert('RGB')
-        image = image.transpose(Image.Transpose.ROTATE_180)
+        if not self.flip:
+            image = image.transpose(Image.Transpose.ROTATE_180)
         if image.size != (self.width, self.height):
             image = image.resize((self.width, self.height), Image.Resampling.LANCZOS)
         source = image.tobytes()
@@ -569,7 +572,7 @@ BTN_CX, BTN_CY, BTN_R = 436, 244, 22          # right side, above the timeline
 BTN_HIT = 34                                  # generous touch target (px radius)
 wake = threading.Event()
 tap_event = threading.Event()                 # any touch: wake the idle screen
-touch_state = {'visible': False, 'source': '', 'state': 'stop'}
+touch_state = {'visible': False, 'menu': False, 'source': '', 'state': 'stop'}
 
 
 def toggle_playback(cfg):
@@ -673,6 +676,7 @@ def touch_thread(cfg):
     x_min, x_max = float(tcfg.get('x_min', 0)), float(tcfg.get('x_max', 4095))
     y_min, y_max = float(tcfg.get('y_min', 0)), float(tcfg.get('y_max', 4095))
     debug = bool(tcfg.get('debug'))
+    flip = bool(cfg.get('flip', False))
     while True:
         try:
             panel = TouchPanel(tcfg)
@@ -698,10 +702,18 @@ def touch_thread(cfg):
                     fy = min(1.0, max(0.0, (ry - lo_y) / (hi_y - lo_y)))
                     px = (1 - fx if inv_x else fx) * WIDTH
                     py = (1 - fy if inv_y else fy) * HEIGHT
+                    if flip:                         # picture rotated by 180: the touch plane follows
+                        px, py = WIDTH - px, HEIGHT - py
                     if debug:
                         print(f'Touch raw={last} -> {px:.0f},{py:.0f}', flush=True)
                     tap_event.set()
-                    if (touch_state['visible'] and abs(px - BTN_CX) <= BTN_HIT
+                    if touch_state['menu']:
+                        ui_events.put(('tap', px, py))
+                        wake.set()
+                    elif touch_state['visible'] and px < MENU_HIT_W and py < MENU_HIT_H:
+                        ui_events.put(('open',))
+                        wake.set()
+                    elif (touch_state['visible'] and abs(px - BTN_CX) <= BTN_HIT
                             and abs(py - BTN_CY) <= BTN_HIT):
                         toggle_playback(cfg)
                 last, down_samples = None, 0
@@ -709,6 +721,303 @@ def touch_thread(cfg):
         except Exception as exc:
             print(f'Touch reader error: {exc}', flush=True)
         time.sleep(10)
+
+
+# --- Setup menu (touch + IR remote) -------------------------------------------
+# Opened by a tap on the header (left) or the remote's "menu" key. Everything it
+# does goes through /usr/local/bin/streamer-config, the same code the web UI uses.
+CTL_SOCKET = '/run/music-display.sock'        # streamer-ir sends menu keys here
+MENU_FLAG = '/run/music-display-menu'         # exists while the menu is open (streamer-ir looks at it)
+STREAMER_CONFIG = '/usr/local/bin/streamer-config'
+MENU_TIMEOUT = 90.0                           # close after this long without input
+MENU_HIT_W, MENU_HIT_H = 200, 44              # tap area in the header that opens the menu
+ui_events = queue.Queue()
+
+
+def ctl_thread():
+    """Receive menu keys (up/down/ok/back/close/open) from streamer-ir."""
+    while True:
+        try:
+            try:
+                os.unlink(CTL_SOCKET)
+            except FileNotFoundError:
+                pass
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            sock.bind(CTL_SOCKET)
+            os.chmod(CTL_SOCKET, 0o660)
+            while True:
+                cmd = sock.recv(64).decode(errors='ignore').strip()
+                if cmd in ('up', 'down', 'ok', 'back', 'close', 'open'):
+                    ui_events.put((cmd,))
+                    tap_event.set()
+                    wake.set()
+        except Exception as exc:
+            print(f'Menu control socket error: {exc}', flush=True)
+            time.sleep(5)
+
+
+def set_menu_flag(on):
+    try:
+        if on:
+            Path(MENU_FLAG).touch()
+        else:
+            Path(MENU_FLAG).unlink()
+    except OSError:
+        pass
+
+
+def streamer_json(*args):
+    try:
+        r = subprocess.run([STREAMER_CONFIG, *args], capture_output=True, text=True, timeout=20)
+        return json.loads(r.stdout)
+    except Exception as exc:
+        print(f'streamer-config {" ".join(args)} failed: {exc}', flush=True)
+        return None
+
+
+def qr_image(text, size):
+    """QR code as an image of about `size` px, or None when python3-qrcode is not installed."""
+    try:
+        import qrcode
+        qr = qrcode.QRCode(border=2, error_correction=qrcode.constants.ERROR_CORRECT_L)
+        qr.add_data(text)
+        qr.make(fit=True)
+        matrix = qr.get_matrix()
+    except Exception:
+        return None
+    scale = max(1, size // len(matrix))
+    im = Image.new('RGB', (len(matrix) * scale,) * 2, 'white')
+    d = ImageDraw.Draw(im)
+    for y, line in enumerate(matrix):
+        for x, black in enumerate(line):
+            if black:
+                d.rectangle((x * scale, y * scale, (x + 1) * scale - 1, (y + 1) * scale - 1), fill='black')
+    return im
+
+
+class Menu:
+    TOP, ROW_H, ROWS = 40, 40, 5
+    BAR_Y = 266
+
+    def __init__(self):
+        self.stack = []
+        self.message = ('', 0.0)
+        self.last_input = time.monotonic()
+        self.dirty = True
+        self.push(self.root_page())
+
+    # -- pages ------------------------------------------------------------------
+    def root_page(self):
+        return {'title': 'Menu', 'index': 0, 'rows': [
+            ('Info: address and PIN', lambda: self.push(self.info_page())),
+            ('Audio output', lambda: self.push(self.audio_page())),
+            ('Flip display 180°', self.flip),
+            ('Setup hotspot', lambda: self.push(self.hotspot_page())),
+            ('Reboot', lambda: self.push(self.confirm_page('Reboot', 'reboot'))),
+            ('Power off', lambda: self.push(self.confirm_page('Power off', 'poweroff'))),
+            ('Close menu', lambda: 'close'),
+        ]}
+
+    def info_page(self):
+        info = streamer_json('info') or {}
+        hs = info.get('hotspot')
+        lines = [('Open on a phone or PC:', 'dim')]
+        if info.get('url'):
+            lines.append((info['url'].replace('http://', ''), 'big'))
+        if info.get('mdns'):
+            lines.append((info['mdns'].replace('http://', ''), 'dim'))
+        if not info.get('url'):
+            lines.append(('no network yet', 'warn'))
+        lines.append(('', 'dim'))
+        lines.append(('PIN  ' + str(info.get('pin', '------')), 'big'))
+        qr_text = info.get('url')
+        if hs:
+            lines += [('', 'dim'), ('Hotspot: ' + hs['ssid'], 'dim'), ('Password: ' + hs['psk'], 'dim')]
+            qr_text = f'WIFI:T:WPA;S:{hs["ssid"]};P:{hs["psk"]};;'
+        return {'title': 'Info', 'index': 0, 'rows': [], 'lines': lines, 'qr': qr_text}
+
+    def audio_page(self):
+        data = streamer_json('audio-list') or {'cards': [], 'choice': 'auto'}
+        rows = [(('• ' if data['choice'] == 'auto' else '') + 'Automatic (USB first)',
+                 lambda: self.set_audio('auto'))]
+        for c in data['cards']:
+            label = ('• ' if data['choice'] == c['id'] else '') + c['name'][:30] + (' (USB)' if c['usb'] else '')
+            rows.append((label, lambda cid=c['id']: self.set_audio(cid)))
+        return {'title': 'Audio output', 'index': 0, 'rows': rows}
+
+    def hotspot_page(self):
+        return {'title': 'Setup hotspot', 'index': 0, 'rows': [
+            ('Start hotspot', lambda: self.hotspot(True)),
+            ('Stop hotspot', lambda: self.hotspot(False)),
+        ], 'lines': None}
+
+    def confirm_page(self, title, cmd):
+        return {'title': title + '?', 'index': 1, 'rows': [
+            ('Yes, ' + title.lower(), lambda: self.power(cmd)),
+            ('Cancel', lambda: self.pop()),
+        ]}
+
+    # -- actions ------------------------------------------------------------------
+    def say(self, text):
+        self.message = (text, time.monotonic() + 5)
+        self.dirty = True
+
+    def push(self, page):
+        self.stack.append(page)
+        self.dirty = True
+
+    def pop(self):
+        if len(self.stack) > 1:
+            self.stack.pop()
+            self.dirty = True
+            return None
+        return 'close'
+
+    def run_bg(self, args, then=None):
+        def go():
+            try:
+                r = subprocess.run(args, capture_output=True, text=True, timeout=60)
+                out = (r.stdout + r.stderr).strip().splitlines()
+                self.say(out[-1][:60] if out and r.returncode else 'Done')
+            except Exception as exc:
+                self.say(f'Failed: {exc}'[:60])
+            if then:
+                ui_events.put((then,))
+                wake.set()
+        threading.Thread(target=go, daemon=True).start()
+
+    def set_audio(self, card):
+        self.say('Switching audio output...')
+        self.run_bg([STREAMER_CONFIG, 'audio-set', card])
+        self.stack = self.stack[:1]
+        self.dirty = True
+
+    def flip(self):
+        self.say('Flipping, the display restarts...')
+        subprocess.Popen([STREAMER_CONFIG, 'flip-toggle'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def hotspot(self, on):
+        self.say('Starting hotspot, about 10 s...' if on else 'Stopping hotspot...')
+        self.run_bg([STREAMER_CONFIG, 'hotspot', 'on' if on else 'off'], then='info')
+
+    def power(self, cmd):
+        self.say('Rebooting...' if cmd == 'reboot' else 'Shutting down...')
+        subprocess.Popen([STREAMER_CONFIG, cmd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return 'close'
+
+    # -- input ------------------------------------------------------------------
+    @property
+    def page(self):
+        return self.stack[-1]
+
+    def activate(self):
+        p = self.page
+        if p['rows']:
+            return p['rows'][p['index']][1]()
+        return self.pop()
+
+    def key(self, name):
+        p = self.page
+        if name == 'up':
+            p['index'] = max(0, p['index'] - 1)
+        elif name == 'down':
+            p['index'] = min(max(0, len(p['rows']) - 1), p['index'] + 1)
+        elif name == 'ok':
+            r = self.activate()
+            self.dirty = True
+            return r
+        elif name == 'back':
+            return self.pop()
+        elif name == 'close':
+            return 'close'
+        self.dirty = True
+        return None
+
+    def offset(self):
+        p = self.page
+        return max(0, min(p['index'] - 2, len(p['rows']) - self.ROWS))
+
+    def tap(self, x, y):
+        if y >= self.BAR_Y - 4:
+            return self.key(['back', 'up', 'down', 'ok'][min(3, int(x // 120))])
+        p = self.page
+        if p['rows'] and self.TOP <= y < self.TOP + self.ROWS * self.ROW_H:
+            idx = self.offset() + int((y - self.TOP) // self.ROW_H)
+            if idx < len(p['rows']):
+                if idx == p['index']:
+                    return self.key('ok')
+                p['index'] = idx
+                self.dirty = True
+        return None
+
+    def tick(self):
+        if self.message[0] and time.monotonic() > self.message[1]:
+            self.message = ('', 0.0)
+            self.dirty = True
+
+    # -- drawing ----------------------------------------------------------------
+    def render(self):
+        im = Image.new('RGB', (WIDTH, HEIGHT), '#0B111A')
+        d = ImageDraw.Draw(im)
+        f_title, f_row = font(FONT_BOLD, 14), font(FONT_REG, 16)
+        f_small, f_big = font(FONT_REG, 12), font(FONT_BOLD, 22)
+        p = self.page
+        d.rectangle((0, 0, WIDTH, 32), fill='#182634')
+        crumbs = ' › '.join(['Menu'] + [s['title'] for s in self.stack[1:]]) if len(self.stack) > 1 else 'Menu'
+        d.text((14, 8), crumbs, font=f_title, fill='#DDE7F2')
+        if p['rows']:
+            off = self.offset()
+            for i, (label, _fn) in enumerate(p['rows'][off:off + self.ROWS]):
+                y = self.TOP + i * self.ROW_H
+                sel = (off + i) == p['index']
+                d.rounded_rectangle((10, y, WIDTH - 10, y + self.ROW_H - 6), radius=8,
+                                    fill='#18352F' if sel else '#121C28',
+                                    outline='#70D0B2' if sel else None, width=2)
+                d.text((24, y + 9), label, font=f_row, fill='#F2F5F8' if sel else '#B7C6D5')
+            if len(p['rows']) > self.ROWS:
+                d.text((WIDTH - 24, self.TOP + 2), '▲' if off > 0 else '', font=f_small, fill='#91A8BA')
+                d.text((WIDTH - 24, self.TOP + self.ROWS * self.ROW_H - 22),
+                       '▼' if off + self.ROWS < len(p['rows']) else '', font=f_small, fill='#91A8BA')
+        if p.get('lines'):
+            y = 46
+            for text, style in p['lines']:
+                fnt = f_big if style == 'big' else f_small if style == 'dim' else f_row
+                d.text((16, y), text, font=fnt, fill={'big': '#F2F5F8', 'warn': '#F0B27A'}.get(style, '#9FB1C3'))
+                y += 30 if style == 'big' else 20
+        if p.get('qr'):
+            qr = qr_image(p['qr'], 190)
+            if qr:
+                im.paste(qr, (WIDTH - qr.width - 12, 42))
+        if self.message[0]:
+            d.text((14, self.BAR_Y - 20), self.message[0], font=f_small, fill='#8DE0C2')
+        for i, label in enumerate(['BACK', '▲', '▼', 'OK']):
+            x0 = 10 + i * 118
+            d.rounded_rectangle((x0, self.BAR_Y, x0 + 108, HEIGHT - 8), radius=8, fill='#182634')
+            w = d.textbbox((0, 0), label, font=f_title)[2]
+            d.text((x0 + (108 - w) // 2, self.BAR_Y + 12), label, font=f_title, fill='#DDE7F2')
+        return im
+
+
+def handle_ui(menu, ev):
+    kind = ev[0]
+    if kind == 'open':
+        return menu or Menu()
+    if menu is None:
+        return None
+    menu.last_input = time.monotonic()
+    try:
+        if kind == 'tap':
+            result = menu.tap(ev[1], ev[2])
+        elif kind == 'info':
+            menu.push(menu.info_page())
+            result = None
+        else:
+            result = menu.key(kind)
+    except Exception as exc:                      # a failing menu action must never take the display down
+        print(f'Menu error: {exc}', flush=True)
+        menu.say(f'Failed: {exc}'[:60])
+        result = None
+    return None if result == 'close' else menu
 
 
 def fmt_time(seconds):
@@ -728,6 +1037,8 @@ def render(snapshot, art, now):
 
     # Header
     d.ellipse((16, 17, 24, 25), fill='#68D4B0')
+    for bar in range(3):                          # menu icon (tap the header to open the menu)
+        d.rectangle((150, 15 + bar * 4, 164, 16 + bar * 4), fill='#91A8BA')
     d.text((32, 14), 'NOW PLAYING', font=f_header, fill='#DDE7F2')
     source = str(snapshot.get('source') or 'STREAMER').upper()
     source = source[:18]
@@ -807,6 +1118,8 @@ def main():
     idle_last_frame = 0.0
     running = True
     threading.Thread(target=touch_thread, args=(cfg,), daemon=True).start()
+    threading.Thread(target=ctl_thread, daemon=True).start()
+    menu, menu_flag_on = None, False
 
     def stop_signal(_sig, _frame):
         nonlocal running
@@ -829,6 +1142,30 @@ def main():
 
             state = str(snapshot.get('state', 'stop')).lower()
             touch_state.update(source=str(snapshot.get('source') or '').lower(), state=state, visible=False)
+
+            # Setup menu: handle queued taps / remote keys; while it is open it replaces the track view.
+            while True:
+                try:
+                    menu = handle_ui(menu, ui_events.get_nowait())
+                except queue.Empty:
+                    break
+            if menu is not None and time.monotonic() - menu.last_input > MENU_TIMEOUT:
+                menu = None
+            if (menu is not None) != menu_flag_on:
+                menu_flag_on = menu is not None
+                set_menu_flag(menu_flag_on)
+                last_render_key = None
+            touch_state['menu'] = menu is not None
+            if menu is not None:
+                tap_event.clear()
+                idle_since, screen_cleared, idle_logo, idle_last_frame = None, False, None, 0.0
+                menu.tick()
+                if menu.dirty:
+                    menu.dirty = False
+                    fb.show(menu.render())
+                wake.wait(0.3)
+                wake.clear()
+                continue
 
             # A tap anywhere leaves the idle screen and restarts the idle timer,
             # so play can be pressed again after a stop/pause.
@@ -935,6 +1272,7 @@ def main():
             elapsed = time.monotonic() - started
             wake.wait(max(0.05, poll - elapsed)); wake.clear()
     finally:
+        set_menu_flag(False)
         fb.close()
 
 
@@ -963,6 +1301,7 @@ if [[ ! -e "$CFG" ]]; then
   "source": "auto",
   "poll_seconds": 2.0,
   "idle_clear_seconds": 180,
+  "flip": false,
   "mpd": {
     "host": "127.0.0.1",
     "port": 6600,
@@ -980,6 +1319,7 @@ import sys
 p = Path(sys.argv[1])
 cfg = json.loads(p.read_text())
 cfg.setdefault("idle_clear_seconds", 180)
+cfg.setdefault("flip", False)
 # Migrate the pre-Soloist key (librespot.json is no longer written by anything).
 legacy = cfg.pop("librespot_state", None)
 if legacy and "spotify_state" not in cfg:

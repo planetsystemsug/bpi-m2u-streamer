@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Streamer setup</title>
+<style>
+:root {
+  --bg: #f4f6f8; --card: #fff; --text: #17212b; --muted: #5d6b79; --line: #d9e0e6;
+  --accent: #14806a; --accent-text: #fff; --danger: #b3261e; --ok: #14806a;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0b111a; --card: #141d29; --text: #e6edf3; --muted: #93a4b5; --line: #263342;
+          --accent: #4cc5a6; --accent-text: #06231c; --danger: #ff8a80; --ok: #4cc5a6; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.45 system-ui, sans-serif; }
+header { padding: 14px 16px; border-bottom: 1px solid var(--line); background: var(--card);
+         display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+header h1 { margin: 0; font-size: 18px; }
+nav { display: flex; gap: 4px; overflow-x: auto; padding: 8px 12px; background: var(--card);
+      border-bottom: 1px solid var(--line); }
+nav button { flex: none; background: none; color: var(--muted); border: 0; padding: 8px 12px;
+             border-radius: 8px; font: inherit; cursor: pointer; }
+nav button.on { background: var(--accent); color: var(--accent-text); }
+main { max-width: 720px; margin: 0 auto; padding: 16px; }
+section { display: none; } section.on { display: block; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px;
+        margin-bottom: 14px; }
+.card h2 { margin: 0 0 8px; font-size: 16px; }
+.muted { color: var(--muted); font-size: 14px; }
+label { display: block; margin: 10px 0 4px; font-size: 14px; color: var(--muted); }
+input, select { width: 100%; padding: 10px; font: inherit; color: var(--text); background: var(--bg);
+                border: 1px solid var(--line); border-radius: 8px; }
+input[type=checkbox] { width: auto; }
+button.act { background: var(--accent); color: var(--accent-text); border: 0; padding: 10px 16px;
+             border-radius: 8px; font: inherit; font-weight: 600; cursor: pointer; margin: 10px 8px 0 0; }
+button.sec { background: none; color: var(--text); border: 1px solid var(--line); }
+button.bad { background: var(--danger); color: #fff; }
+button:disabled { opacity: .5; }
+.row { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 0;
+       border-top: 1px solid var(--line); }
+.row:first-of-type { border-top: 0; }
+.pill { font-size: 12px; padding: 2px 8px; border-radius: 99px; border: 1px solid var(--line); color: var(--muted); }
+.pill.ok { color: var(--ok); border-color: var(--ok); }
+.pill.bad { color: var(--danger); border-color: var(--danger); }
+#toast { position: fixed; left: 12px; right: 12px; bottom: 12px; max-width: 720px; margin: 0 auto;
+         padding: 12px 14px; border-radius: 10px; background: var(--text); color: var(--bg);
+         display: none; z-index: 5; }
+#toast.err { background: var(--danger); color: #fff; }
+#login { max-width: 360px; margin: 12vh auto; padding: 0 16px; }
+pre { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px;
+      overflow: auto; max-height: 320px; font-size: 12px; }
+.pin { letter-spacing: .4em; font-size: 24px; text-align: center; }
+</style>
+</head>
+<body>
+<div id="login" hidden>
+  <div class="card">
+    <h2>Streamer setup</h2>
+    <p class="muted">Enter the 6-digit PIN shown on the display: Menu &rarr; Info.</p>
+    <input id="pin" class="pin" inputmode="numeric" maxlength="6" autocomplete="off" placeholder="------">
+    <button class="act" id="loginBtn">Log in</button>
+  </div>
+</div>
+
+<div id="app" hidden>
+<header><h1 id="title">Streamer setup</h1><span class="muted" id="hostinfo"></span></header>
+<nav id="tabs"></nav>
+<main>
+
+<section id="t-status">
+  <div class="card"><h2>Network</h2><div id="st-net"></div></div>
+  <div class="card"><h2>Services</h2><div id="st-svc"></div></div>
+</section>
+
+<section id="t-network">
+  <div class="card" id="hs-card" hidden>
+    <h2>Setup hotspot is on</h2>
+    <p class="muted" id="hs-text"></p>
+    <button class="act sec" onclick="post('hotspot',{on:false})">Stop hotspot</button>
+  </div>
+  <div class="card">
+    <h2>Wi-Fi</h2>
+    <div id="wifi-saved"></div>
+    <button class="act" id="scanBtn">Scan for networks</button>
+    <div id="scan-list"></div>
+    <label>Network name (SSID)</label><input id="w-ssid" autocomplete="off" autocapitalize="none">
+    <label>Password (empty for an open network)</label><input id="w-pass" type="password" autocomplete="off">
+    <label><input type="checkbox" id="w-hidden"> Hidden network</label>
+    <button class="act" id="connectBtn">Save and connect</button>
+    <p class="muted">The box switches networks right away. If the connection fails, the setup hotspot
+      returns after a minute or two.</p>
+  </div>
+  <div class="card"><h2>Wi-Fi address</h2><div id="ip-wifi"></div></div>
+  <div class="card"><h2>Ethernet address</h2><div id="ip-ethernet"></div></div>
+  <div class="card">
+    <h2>Setup hotspot</h2>
+    <p class="muted" id="hs-avail">Opens its own Wi-Fi network so a phone can reach this page when the box has no network.</p>
+    <button class="act sec" id="hsOn">Start hotspot</button>
+  </div>
+</section>
+
+<section id="t-audio">
+  <div class="card">
+    <h2>Audio output</h2>
+    <div id="audio-cards"></div>
+    <label>DAC volume when a USB card is activated (%)</label><input id="a-vol" type="number" min="0" max="100">
+    <button class="act" id="audioSave">Save</button>
+    <button class="act sec" onclick="post('audio/test',{side:'left'})">Test left</button>
+    <button class="act sec" onclick="post('audio/test',{side:'right'})">Test right</button>
+    <button class="act sec" onclick="post('audio/test',{side:'both'})">Left, then right</button>
+    <p class="muted">"Automatic" uses a USB amplifier when plugged in and the onboard output otherwise.
+      Players restart for a few seconds when the output changes.</p>
+  </div>
+</section>
+
+<section id="t-spotify">
+  <div class="card">
+    <h2>Spotify Connect</h2>
+    <div id="sp-status"></div>
+    <label>Soloist API key</label>
+    <input id="sp-key" type="password" autocomplete="off" autocapitalize="none">
+    <button class="act" id="keySave">Store key and start</button>
+    <p class="muted">Create the key at developer.spotify.com/dashboard/soloist (Premium account). The key
+      is passed to Soloist and not kept by this page. Then pick the device in the Spotify app on a phone in the same network.</p>
+  </div>
+  <div class="card">
+    <h2>Device name</h2>
+    <input id="sp-name" maxlength="40">
+    <button class="act" id="nameSave">Rename</button>
+    <p class="muted">Letters, digits, - and _ only.</p>
+  </div>
+</section>
+
+<section id="t-display">
+  <div class="card">
+    <h2>Display</h2>
+    <label><input type="checkbox" id="d-flip"> Rotate the picture by 180&deg; (also flips the touch panel)</label>
+    <label>Idle animation after (seconds, 0 = immediately)</label><input id="d-idle" type="number" min="0" max="86400">
+    <button class="act" id="dispSave">Save</button>
+  </div>
+</section>
+
+<section id="t-remote">
+  <div class="card">
+    <h2>Remote control</h2>
+    <p class="muted">Press a key on the remote: new codes appear below. Pick an action and save.
+      Use the action <b>menu</b> to open the menu on the display.</p>
+    <div id="ir-seen"></div>
+    <h2 style="margin-top:14px">Key map</h2>
+    <div id="ir-keys"></div>
+    <button class="act" id="irSave">Save map</button>
+    <button class="act sec" onclick="load()">Refresh</button>
+  </div>
+</section>
+
+<section id="t-system">
+  <div class="card">
+    <h2>Host name</h2>
+    <input id="s-host"><button class="act" id="hostSave">Save</button>
+    <h2 style="margin-top:14px">Time zone</h2>
+    <input id="s-tz" placeholder="Europe/Berlin"><button class="act" id="tzSave">Save</button>
+  </div>
+  <div class="card">
+    <h2>Maintenance</h2>
+    <button class="act sec" onclick="post('rescan',{})">Rescan music library</button>
+    <button class="act sec" onclick="post('soloist/update',{})">Update Soloist now</button>
+    <button class="act sec" onclick="post('pin/new',{}).then(()=>location.reload())">New setup PIN</button>
+    <h2 style="margin-top:14px">Restart a service</h2>
+    <select id="s-svc"></select>
+    <button class="act sec" id="svcRestart">Restart</button>
+    <button class="act sec" id="svcLog">Show log</button>
+    <pre id="logbox" hidden></pre>
+  </div>
+  <div class="card">
+    <h2>Power</h2>
+    <button class="act bad" onclick="if(confirm('Reboot now?'))post('reboot',{})">Reboot</button>
+    <button class="act bad" onclick="if(confirm('Shut down now? The box must be powered on again by hand.'))post('poweroff',{})">Shut down</button>
+  </div>
+</section>
+
+</main>
+</div>
+<div id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const TABS = [['status','Status'],['network','Network'],['audio','Audio'],['spotify','Spotify'],
+              ['display','Display'],['remote','Remote'],['system','System']];
+let S = null, tab = 'status';
+
+function toast(msg, err) {
+  const t = $('toast'); t.textContent = msg; t.className = err ? 'err' : '';
+  t.style.display = 'block'; clearTimeout(toast.t);
+  toast.t = setTimeout(() => t.style.display = 'none', err ? 8000 : 6000);
+}
+async function api(path, body) {
+  const opt = body === undefined ? {} : {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                          body: JSON.stringify(body)};
+  let r;
+  try { r = await fetch('/api/' + path, opt); }
+  catch (e) { throw new Error('No connection (the network may be restarting).'); }
+  if (r.status === 401) { showLogin(); throw new Error('Please log in.'); }
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || 'Request failed');
+  return j;
+}
+async function post(path, body) {
+  try { const j = await api(path, body); toast(j.message || 'Done'); setTimeout(load, 1500); return j; }
+  catch (e) { toast(e.message, true); }
+}
+function el(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === 'class') e.className = v; else if (k.startsWith('on')) e[k] = v; else e.setAttribute(k, v);
+  }
+  for (const k of kids) e.append(k);
+  return e;
+}
+function row(left, right) { return el('div', {class: 'row'}, el('div', {}, ...[].concat(left)), right || ''); }
+function pill(text, cls) { return el('span', {class: 'pill ' + (cls || '')}, text); }
+
+function showLogin() { $('app').hidden = true; $('login').hidden = false; $('pin').focus(); }
+$('loginBtn').onclick = async () => {
+  try { await api('login', {pin: $('pin').value}); $('login').hidden = true; await load(); }
+  catch (e) { toast(e.message, true); }
+};
+$('pin').onkeydown = e => { if (e.key === 'Enter') $('loginBtn').click(); };
+
+function buildTabs() {
+  const nav = $('tabs'); nav.textContent = '';
+  for (const [id, label] of TABS) {
+    nav.append(el('button', {class: id === tab ? 'on' : '', onclick: () => { tab = id; buildTabs(); show(); }}, label));
+    $('t-' + id).className = id === tab ? 'on' : '';
+  }
+}
+function show() { for (const [id] of TABS) $('t-' + id).className = id === tab ? 'on' : ''; }
+
+async function load() {
+  try { S = await api('state'); } catch (e) { return; }
+  $('login').hidden = true; $('app').hidden = false;
+  render(); buildTabs();
+}
+
+function ipForm(kind, cur) {
+  const box = $('ip-' + kind); box.textContent = '';
+  cur = cur || {mode: 'dhcp'};
+  const mode = el('select', {id: kind + '-mode'}, el('option', {value: 'dhcp'}, 'Automatic (DHCP)'),
+                  el('option', {value: 'static'}, 'Fixed address'));
+  mode.value = cur.mode;
+  const f = el('div', {id: kind + '-static'},
+    el('label', {}, 'Address with prefix, e.g. 192.168.1.50/24'), el('input', {id: kind + '-addr', value: cur.address || ''}),
+    el('label', {}, 'Gateway'), el('input', {id: kind + '-gw', value: cur.gateway || ''}),
+    el('label', {}, 'DNS servers (space separated)'), el('input', {id: kind + '-dns', value: (cur.dns || []).join(' ')}));
+  const upd = () => f.hidden = mode.value !== 'static'; mode.onchange = upd; upd();
+  box.append(mode, f, el('button', {class: 'act', onclick: () => {
+    if (confirm('Apply now? The connection to this page may drop.'))
+      post('ip', {kind, mode: mode.value, address: $(kind + '-addr').value, gateway: $(kind + '-gw').value,
+                  dns: $(kind + '-dns').value});
+  }}, 'Apply'));
+}
+
+function render() {
+  const i = S.info;
+  $('hostinfo').textContent = i.hostname + (i.ip ? ' · ' + i.ip : '');
+  // status
+  const n = $('st-net'); n.textContent = '';
+  for (const x of S.net) {
+    n.append(row([el('b', {}, x.iface), ' ', x.kind === 'wifi' ? (x.hotspot ? 'hotspot' : (x.ssid || 'Wi-Fi')) : 'Ethernet',
+                  el('div', {class: 'muted'}, x.addresses.join(', ') || 'no address')],
+                 pill(x.state || '?', x.state === 'up' ? 'ok' : '')));
+  }
+  const sv = $('st-svc'); sv.textContent = '';
+  for (const [k, v] of Object.entries(S.system.services))
+    sv.append(row(k, pill(v, v === 'active' ? 'ok' : 'bad')));
+  sv.append(el('p', {class: 'muted'}, S.system.uptime || ''));
+  // network
+  $('hs-card').hidden = !i.hotspot;
+  if (i.hotspot) $('hs-text').textContent = `Network "${i.hotspot.ssid}", password ${i.hotspot.psk}, this page: http://${i.hotspot.ip}`;
+  $('hsOn').hidden = !S.hotspot_available || !!i.hotspot;
+  if (!S.hotspot_available) { $('hs-avail').textContent = 'Not available: hostapd is not installed on this box.'; }
+  const ws = $('wifi-saved'); ws.textContent = '';
+  for (const w of S.wifi_saved)
+    ws.append(row(w.ssid, el('button', {class: 'act sec', onclick: () => confirm('Forget ' + w.ssid + '?') && post('wifi/forget', {ssid: w.ssid})}, 'Forget')));
+  for (const w of S.wifi_system) ws.append(row([w, ' ', el('span', {class: 'muted'}, '(system setup)')], ''));
+  if (!ws.childNodes.length) ws.append(el('p', {class: 'muted'}, 'No saved networks.'));
+  ipForm('wifi', S.ip.wifi); ipForm('ethernet', S.ip.ethernet);
+  // audio
+  const ac = $('audio-cards'); ac.textContent = '';
+  const choices = [{id: 'auto', name: 'Automatic (USB amplifier first)', usb: false}, ...S.audio.cards];
+  for (const c of choices) {
+    const r = el('input', {type: 'radio', name: 'card', value: c.id}); r.checked = c.id === S.audio.choice;
+    ac.append(el('label', {style: 'color:var(--text);display:flex;gap:10px;align-items:center'}, r,
+                 el('span', {}, c.name + (c.id !== 'auto' ? ` (${c.id})` : ''), ' ',
+                    c.usb ? pill('USB') : '', c.active ? pill('in use', 'ok') : '')));
+  }
+  $('a-vol').value = S.audio.pcm_volume;
+  // spotify
+  const sp = S.spotify, st = $('sp-status'); st.textContent = '';
+  st.append(row('Service', pill(sp.active ? 'running' : (sp.enabled ? 'stopped' : 'not set up'), sp.active ? 'ok' : 'bad')),
+            row('API key', pill(sp.key_stored ? 'stored' : 'missing', sp.key_stored ? 'ok' : 'bad')));
+  $('sp-name').value = sp.name;
+  // display
+  $('d-flip').checked = S.display.flip; $('d-idle').value = S.display.idle_clear_seconds;
+  // remote
+  const seen = $('ir-seen'); seen.textContent = '';
+  const known = S.ir.keys;
+  const mk = (code, cur) => {
+    const sel = el('select', {'data-code': code}, el('option', {value: ''}, '— none —'),
+                   ...S.ir.actions.map(a => el('option', {value: a}, a)));
+    sel.value = cur || ''; return sel;
+  };
+  const codes = [...new Set([...(S.ir.seen || []).map(s => s.code), ...Object.keys(known)])];
+  const irk = $('ir-keys'); irk.textContent = '';
+  for (const c of codes) {
+    const isNew = !(c in known);
+    irk.append(row([el('code', {}, c), isNew ? [' ', pill('new', 'ok')] : ''], mk(c, known[c])));
+  }
+  if (!codes.length) irk.append(el('p', {class: 'muted'}, 'Nothing yet. Press keys on the remote and refresh.'));
+  // system
+  $('s-host').value = S.system.hostname; $('s-tz').value = S.system.timezone;
+  const ss = $('s-svc'); if (!ss.options.length) for (const k of Object.keys(S.system.services)) if (k !== 'streamer-config') ss.append(el('option', {}, k));
+}
+
+$('scanBtn').onclick = async () => {
+  $('scanBtn').disabled = true; toast('Scanning…');
+  try {
+    const j = await api('wifi/scan'); const box = $('scan-list'); box.textContent = '';
+    for (const w of j.networks)
+      box.append(row([w.ssid, ' ', w.secure ? pill('secured') : pill('open'), ' ', pill(Math.round(w.signal) + ' dBm')],
+                     el('button', {class: 'act sec', onclick: () => { $('w-ssid').value = w.ssid; $('w-pass').focus(); }}, 'Choose')));
+    toast(j.networks.length + ' networks found');
+  } catch (e) { toast(e.message, true); }
+  $('scanBtn').disabled = false;
+};
+$('connectBtn').onclick = () => post('wifi/connect', {ssid: $('w-ssid').value, password: $('w-pass').value, hidden: $('w-hidden').checked});
+$('hsOn').onclick = () => confirm('The box leaves its Wi-Fi network and opens its own. Continue?') && post('hotspot', {on: true});
+$('audioSave').onclick = () => {
+  const c = document.querySelector('input[name=card]:checked');
+  post('audio', {card: c ? c.value : 'auto', pcm_volume: $('a-vol').value});
+};
+$('keySave').onclick = async () => { const j = await post('spotify/key', {key: $('sp-key').value}); if (j) $('sp-key').value = ''; };
+$('nameSave').onclick = () => post('spotify/name', {name: $('sp-name').value});
+$('dispSave').onclick = () => post('display', {flip: $('d-flip').checked, idle_clear_seconds: $('d-idle').value});
+$('irSave').onclick = () => {
+  const keys = {};
+  document.querySelectorAll('#ir-keys select').forEach(s => { if (s.value) keys[s.dataset.code] = s.value; });
+  post('ir', {keys});
+};
+$('hostSave').onclick = () => post('hostname', {name: $('s-host').value});
+$('tzSave').onclick = () => post('timezone', {timezone: $('s-tz').value});
+$('svcRestart').onclick = () => post('service', {service: $('s-svc').value, action: 'restart'});
+$('svcLog').onclick = async () => {
+  try { const j = await api('logs/' + $('s-svc').value); const b = $('logbox'); b.hidden = false; b.textContent = j.log; b.scrollTop = b.scrollHeight; }
+  catch (e) { toast(e.message, true); }
+};
+load().then(() => { if (!S) showLogin(); });
+setInterval(() => { if (!document.hidden && S && tab === 'status') load(); }, 15000);
+</script>
+</body>
+</html>

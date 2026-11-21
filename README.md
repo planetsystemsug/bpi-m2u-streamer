@@ -26,6 +26,7 @@
 - [Spotify setup](#spotify-setup-one-time-per-controlling-account)
 - [Local music](#local-music)
 - [Qobuz](#qobuz)
+- [Setup web UI and display menu](#setup-web-ui-and-display-menu)
 - [Display](#display)
 - [Remote control](#remote-control-ir)
 - [Power-off](#power-off)
@@ -39,6 +40,7 @@
 - **USB amp hotplug**: the audio output follows the USB amplifier when it is plugged in and falls back to onboard audio when it is not. Playback resumes on the new card without manual steps.
 - **Last one started wins**: starting Spotify pauses MPD (resumed when the Spotify session ends); starting MPD pauses Spotify.
 - **Now-playing display** with album art, progress, a boot splash and a bouncing-logo idle screen.
+- **Setup without SSH**: a small web UI (Wi-Fi, Ethernet, audio output, Spotify key, display flip, remote key map, host name, time zone) and a touch/remote menu on the display; a fresh box with no network opens its own setup hotspot.
 - **Self-maintaining**: Soloist builds expire after 90 days, so a weekly timer fetches the latest build.
 
 ## Hardware
@@ -110,7 +112,7 @@ Soloist builds expire 90 days after their build date (exit code 10). `streamer-s
 | `bin/streamer-soloist-event`<br>`systemd/streamer-soloist-event.service` | `/usr/local/bin/`<br>`/etc/systemd/system/` | Spotify priority (pause/resume MPD) and display state file `/var/lib/music-display/spotify.json` |
 | `bin/streamer-soloist-mdns`<br>`systemd/soloist.service.d/10-mdns-lan.conf` | `/usr/local/bin/`<br>`/etc/systemd/system/soloist.service.d/` | Publishes Soloist's Spotify Connect service via avahi with the LAN addresses (Soloist itself advertises the WireGuard address, so phones could not find it for pairing); rewritten on every Soloist start |
 | `bin/streamer-soloist-update.sh`<br>`systemd/streamer-soloist-update.{service,timer}` | `/usr/local/bin/`<br>`/etc/systemd/system/` | Weekly Soloist re-download from soloist-builds.spotifycdn.com |
-| `default/streamer-audio` | `/etc/default/streamer-audio` | `PCM_VOLUME` (DAC volume applied on card activation, default 60) |
+| `default/streamer-audio` | `/etc/default/streamer-audio` | `PCM_VOLUME` (DAC volume applied on card activation, default 60), `AUDIO_CARD` (force one card by id; empty = USB first) |
 | `bin/streamer-audio-default.sh` | `/usr/local/bin/` | Event-driven (`add <card>` / `remove` / `scan` all do the same): recompute the default card, update `/etc/asound.conf`, restart players once the target is openable |
 | `systemd/streamer-audio-default.service` | `/etc/systemd/system/` | Oneshot at boot, runs the script in `scan` mode after `sound.target` |
 | `udev/99-usb-audio.rules` | `/etc/udev/rules.d/` | Runs the script on sound-card add/remove events |
@@ -120,6 +122,7 @@ Soloist builds expire 90 days after their build date (exit code 10). `streamer-s
 | `systemd/mpd.service.d/20-volume.conf` | `/etc/systemd/system/mpd.service.d/` | Sets MPD's software volume to 85% on every start (MPD only saves it on a clean shutdown, so it came back at 100% after a power-off) |
 | `overlay/bpi-m2u-ili9486.dts` | `/boot/overlay-user/` (compiled to `.dtbo`) | Device tree overlay for the ILI9486 SPI panel (spi0, rotate 90, `bgr`) and its touch controller (spidev at CS1); enabled with `user_overlays=bpi-m2u-ili9486` in `/boot/armbianEnv.txt` |
 | `bin/streamer-ir`<br>`systemd/streamer-ir.service`<br>`default/streamer-ir.json` | `/usr/local/bin/`<br>`/etc/systemd/system/`<br>`/etc/streamer-ir.json` (kept if present) | IR remote control: scancodes from the SoC's IR receiver to MPD / Spotify actions |
+| `bin/streamer-config`<br>`web/index.html`<br>`systemd/streamer-config.service` | `/usr/local/bin/`<br>`/usr/local/share/streamer-config/`<br>`/etc/systemd/system/` | Setup web server on port 80, PIN-protected, plus the offline hotspot watchdog; also the CLI behind the display menu (see [Setup web UI](#setup-web-ui-and-display-menu)) |
 | `modules-load.d/spidev.conf` | `/etc/modules-load.d/` | Loads `spidev` at boot for the touch controller |
 | `upmpdcli/upmpdcli.conf` | `/etc/upmpdcli.conf` | UPnP/OpenHome renderer in front of MPD, Qobuz plugin enabled (FLAC 16/44.1), UPnP bound to `wlan0`; no credentials |
 | `deploy/install_upmpdcli.sh` | run on the box | Adds the upmpdcli apt repo, builds upmpdcli for armhf, installs it with the Qobuz plugin and the config |
@@ -152,7 +155,9 @@ Run as root on the box, from a checkout of this repo.
 
 ```sh
 # packages
-apt-get install -y mpd mpc alsa-utils avahi-daemon python3-pil pulseaudio
+apt-get install -y mpd mpc alsa-utils avahi-daemon python3-pil python3-qrcode pulseaudio \
+    hostapd iw python3-yaml
+systemctl disable --now hostapd 2>/dev/null; systemctl mask hostapd   # only started on demand by streamer-config
 
 # Soloist (official arm32 build; streamer-soloist-update.timer keeps it fresh)
 mkdir -p /opt/soloist
@@ -171,7 +176,8 @@ install -m755 bin/streamer-audio-default.sh /usr/local/bin/
 install -m755 bin/streamer-soloist-event /usr/local/bin/
 install -m755 bin/streamer-soloist-update.sh /usr/local/bin/
 install -m755 bin/streamer-soloist-mdns /usr/local/bin/
-install -m755 bin/streamer-ir /usr/local/bin/
+install -m755 bin/streamer-ir bin/streamer-config /usr/local/bin/
+install -Dm644 web/index.html /usr/local/share/streamer-config/index.html
 [ -e /etc/streamer-ir.json ] || install -m644 default/streamer-ir.json /etc/streamer-ir.json
 install -Dm644 systemd/soloist.service.d/10-mdns-lan.conf \
     /etc/systemd/system/soloist.service.d/10-mdns-lan.conf
@@ -187,7 +193,7 @@ install -Dm644 systemd/mpd.service.d/10-after-audio-default.conf \
 cp udev/99-usb-audio.rules /etc/udev/rules.d/
 systemctl daemon-reload
 systemctl enable --now mpd avahi-daemon streamer-audio-default \
-    streamer-pulseaudio streamer-soloist-event streamer-soloist-update.timer streamer-ir
+    streamer-pulseaudio streamer-soloist-event streamer-soloist-update.timer streamer-ir streamer-config
 
 # music dir (must be world-readable)
 mkdir -p /mnt/music_library
@@ -257,6 +263,26 @@ python3 /usr/share/upmpdcli/cdplugins/qobuz/qobuz-init-oauth.py
 
 Open the printed URL that contains the box's LAN address in a browser on the same network.
 
+## Setup web UI and display menu
+
+`streamer-config` (port 80, `systemd/streamer-config.service`) is a dependency-free Python web server for everything a new or running box needs without SSH. Open the address shown on the display (Menu, Info; also as a QR code) or `http://<hostname>.local`, and log in with the 6-digit PIN from the same screen. The PIN is stored in `/var/lib/streamer-config/pin` (`streamer-config pin new` or the System tab makes a new one). It is plain HTTP for the local network: the PIN and the Spotify key are not encrypted in transit, so do not forward the port to the internet.
+
+| Tab | What it does |
+|---|---|
+| Status | Interfaces and addresses, service states |
+| Network | Scan and join Wi-Fi (saved networks, forget), DHCP or fixed address for Wi-Fi and Ethernet, setup hotspot on/off |
+| Audio | Output card (automatic = USB first, or one card forced), DAC volume, left/right test sound |
+| Spotify | Store the Soloist API key (starts the service), rename the Connect device |
+| Display | Rotate the picture 180° (the touch panel follows), idle animation time |
+| Remote | Keys seen by the IR receiver, map them to actions (so a new remote can be set up from the browser) |
+| System | Host name, time zone, library rescan, Soloist update, restart a service and read its log, reboot, power off |
+
+How it changes things: Wi-Fi and fixed addresses go to `/etc/netplan/50-streamer.yaml` (mode 600, validated with `netplan generate` before `netplan apply`; the system's own netplan files are never edited). The audio choice is `AUDIO_CARD` in `/etc/default/streamer-audio`, read by `streamer-audio-default.sh`. The Spotify name is `SOLOIST_NAME` in `/etc/default/streamer-soloist`. Display flip is `flip` in `/etc/music-display/config.json`.
+
+**Setup hotspot.** If the box has no usable address for 90 s (no Wi-Fi saved, wrong password, no cable) and `hostapd` is installed, it opens the Wi-Fi network `BPi-M2U-Setup` (WPA2, random password shown on the display) with the page at `http://192.168.4.1`; systemd-networkd's built-in DHCP server hands out addresses. The hotspot closes when Wi-Fi settings are saved; after 10 minutes without use it is dropped to retry the normal network. It can be started by hand (Network tab or display menu) and disabled with `"auto_hotspot": false` in `/etc/streamer-config.json`. Whether the Wi-Fi chip can run as an access point is not verified on this hardware.
+
+**Display menu.** Tap the left of the header (the ≡ icon) or press the remote's `menu` key (`fn` in the shipped map). With the remote, up/down (`prev_artist`/`next_artist`) move, play/pause or next confirms, prev goes back, source closes; on the touch panel tap a row (a second tap confirms) or use the BACK / ▲ / ▼ / OK buttons. The menu offers Info (address, PIN, QR code), audio output, display flip, hotspot, reboot and power off, and closes after 90 s without input. It calls the `streamer-config` CLI, so the display and the web UI share one code path.
+
 ## Display
 
 480x320 ILI9486 SPI panel on spi0 (`/dev/fb0`, 16 bpp RGB565).
@@ -310,6 +336,7 @@ Default config:
   "source": "auto",
   "poll_seconds": 2.0,
   "idle_clear_seconds": 180,
+  "flip": false,
   "mpd": { "host": "127.0.0.1", "port": 6600, "password": "" },
   "spotify_state": "/var/lib/music-display/spotify.json"
 }
@@ -344,7 +371,8 @@ The shipped map (`default/streamer-ir.json`) is for the 10-key remote in use:
 | source | `0x123407` | `source` (only leaves MPD if Spotify actually starts) |
 | mute | `0x123409` | `mute` (press again to restore) |
 | volume up / down | `0x12340a` / `0x12340b` | `vol_up` / `vol_down` |
-| power (`0x123401`), fn (`0x123408`) | | unmapped on purpose: IR cannot power the box back on |
+| fn | `0x123408` | `menu` (opens the setup menu on the display) |
+| power | `0x123401` | unmapped on purpose: IR cannot power the box back on |
 
 On a box that already has `/etc/streamer-ir.json` the installer keeps it, so copy the new default over it by hand when the map changes.
 

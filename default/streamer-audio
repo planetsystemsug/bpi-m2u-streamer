@@ -6,3 +6,8 @@
 # Re-check after changing the DAC/amplifier. MPD's volume slider still moves
 # it at runtime.
 PCM_VOLUME=60
+
+# Force one sound card by its id (see /proc/asound/cards, e.g. AUDIO_CARD="audio"),
+# or leave empty: USB amplifier when plugged in, onboard audio otherwise.
+# The setup web UI and the display menu write this line.
+AUDIO_CARD=""

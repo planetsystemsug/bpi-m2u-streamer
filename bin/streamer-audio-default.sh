@@ -22,6 +22,7 @@
 ACTION="$1"; CARD="${2:-}"; CARD="${CARD#card}"
 
 PCM_VOLUME=60
+AUDIO_CARD=""     # card id (from /proc/asound/cards) forced by the setup UI; empty = USB first, else onboard
 [ -r /etc/default/streamer-audio ] && . /etc/default/streamer-audio
 
 exec 9>/run/streamer-audio.lock || exit 0
@@ -36,12 +37,17 @@ conf_for() { printf 'defaults.pcm.rate_converter "samplerate_best"\npcm.dmixer {
 # Without a USB card, fall back to the first (onboard) card so "dmixer" still exists.
 first_card() { for c in /sys/class/sound/card*; do [ -e "$c" ] && { n="${c##*/}"; echo "${n#card}"; return; }; done; }
 usb_card() { for c in /sys/class/sound/card*; do n="${c##*/}"; n="${n#card}"; is_usb_card "$n" && { echo "$n"; return; }; done; }
+# A card chosen in the setup UI wins while it is present; otherwise the USB card, else onboard.
+forced_card() { [ -n "$AUDIO_CARD" ] || return 0; for c in /sys/class/sound/card*; do [ -e "$c/id" ] && [ "$(cat "$c/id")" = "$AUDIO_CARD" ] && { n="${c##*/}"; echo "${n#card}"; return; }; done; }
+pick_card() { local f; f="$(forced_card)"; if [ -n "$f" ]; then echo "$f"; else usb_card; fi; }
+# Only cards with a PCM mixer control can be set/probed; onboard and HDMI cards may not have one.
+has_pcm_ctl() { amixer -c "$1" sget PCM >/dev/null 2>&1; }
 
 marker_file=/run/streamer-audio-active
 
 flock -x 9
 logger -t streamer-audio "event: action=$ACTION card=${CARD:-none}"
-target="$(usb_card)"
+target="$(pick_card)"
 marker="$(cat "$marker_file" 2>/dev/null)"
 
 cur="$(cat /etc/asound.conf 2>/dev/null)"
@@ -63,7 +69,8 @@ flock -u 9
 [ "$need" = 1 ] || exit 0
 ready=1
 i=0
-while [ -n "$target" ] && ! runuser -u mpd -- bash -c "dd if=/dev/zero bs=96 count=2 2>/dev/null | aplay -q -D dmixer -f S16_LE -r 44100 -c 2 && amixer -c $target sget PCM >/dev/null" 2>/dev/null; do
+has_pcm=false; [ -n "$target" ] && has_pcm_ctl "$target" && has_pcm=true
+while [ -n "$target" ] && ! runuser -u mpd -- bash -c "dd if=/dev/zero bs=96 count=2 2>/dev/null | aplay -q -D dmixer -f S16_LE -r 44100 -c 2 && { ! $has_pcm || amixer -c $target sget PCM >/dev/null; }" 2>/dev/null; do
     ready=0
     i=$((i+1))
     [ $i -ge 60 ] && break
@@ -72,11 +79,11 @@ done
 [ "$ready" = 1 ] || exit 0
 
 flock -x 9
-target="$(usb_card)"
+target="$(pick_card)"
 marker="$(cat "$marker_file" 2>/dev/null)"
 if [ "$marker" != "${target:-onboard}" ]; then
     logger -t streamer-audio "restarting players for ${target:-onboard}"
-    if [ -n "$target" ]; then
+    if [ -n "$target" ] && has_pcm_ctl "$target"; then
         amixer -c "$target" sset PCM "${PCM_VOLUME}%" >/dev/null 2>&1 || true
     fi
     systemctl try-restart streamer-pulseaudio 2>/dev/null || true
