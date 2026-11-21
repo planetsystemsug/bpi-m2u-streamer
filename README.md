@@ -86,7 +86,7 @@ The USB DAC (SMSL) is a USB 1.1 full-speed, adaptive device: **16-bit, 44.1 or 4
 - dmix runs at **44.1 kHz / S16_LE**, native for CD material and Spotify. A single 44.1 kHz/16-bit stream passes through unchanged.
 - Higher rates or depths (e.g. 88.2 kHz/24-bit FLAC) are converted once by MPD's `soxr` "very high" resampler and dithered to 16 bit. About 8% CPU on the A7 at 88.2 kHz.
 - Spotify (44.1 kHz) reaches the same dmix with no resampling; PulseAudio uses `soxr-vhq` should a client ever differ.
-- MPD's volume control is the DAC's hardware `PCM` control (no digital attenuation in software). The audio script sets it to `PCM_VOLUME` (60% by default) when a card is activated. The DAC reports its PCM range as 0 to +16 dB, so high settings may clip digitally; keep it moderate and set loudness on the amplifier. Re-check this value when the DAC or amplifier changes.
+- The DAC's hardware `PCM` control is a fixed reference level: the audio script sets it to `PCM_VOLUME` (60% by default) when a card is activated. MPD uses a *software* mixer (`mixer_type "software"`), set to 85%, which sounds equal in loudness to Spotify at 100%. MPD keeps the value in its state file, so on a fresh install run `mpc volume 85` once so that it can be set below Spotify, which plays at 100% and is otherwise quieter than normally mastered music; the attenuation costs less than one bit at 16 bit (MPD dithers). The DAC reports its PCM range as 0 to +16 dB, so high settings may clip digitally; keep it moderate and set loudness on the amplifier. Re-check this value when the DAC or amplifier changes.
 
 ### Spotify vs. MPD: last one started wins
 
@@ -103,7 +103,7 @@ Soloist builds expire 90 days after their build date (exit code 10). `streamer-s
 | `pulse/system.pa` | `/etc/pulse/system.pa` | PulseAudio system-mode config: one ALSA sink (`soloist-sink`) on the `dmixer` PCM (44.1 kHz S16), plus a local unix socket with anonymous auth |
 | `pulse/daemon.conf` | `/etc/pulse/daemon.conf` | 44.1 kHz default rate, `soxr-vhq` resampler for any client that is not 44.1 kHz |
 | `systemd/streamer-pulseaudio.service` | `/etc/systemd/system/` | Runs PulseAudio in system mode (root, group audio) after the audio-default scan; restarted on card switch |
-| `systemd/soloist.service` | `/etc/systemd/system/` | Runs Soloist as user `soloist`, name "BPi-M2U-Streamer", data dir `/var/lib/soloist`, 1 GB cache, initial volume 80%, WebSocket API on 127.0.0.1:8934; clears the MPD-paused flag on start |
+| `systemd/soloist.service` | `/etc/systemd/system/` | Runs Soloist as user `soloist`, name "BPi-M2U-Streamer", data dir `/var/lib/soloist`, 1 GB cache, initial volume 100% (brings Spotify closer to MPD in loudness), WebSocket API on 127.0.0.1:8934; clears the MPD-paused flag on start |
 | `bin/streamer-soloist-event`<br>`systemd/streamer-soloist-event.service` | `/usr/local/bin/`<br>`/etc/systemd/system/` | Spotify priority (pause/resume MPD) and display state file `/var/lib/music-display/spotify.json` |
 | `bin/streamer-soloist-mdns`<br>`systemd/soloist.service.d/10-mdns-lan.conf` | `/usr/local/bin/`<br>`/etc/systemd/system/soloist.service.d/` | Publishes Soloist's Spotify Connect service via avahi with the LAN addresses (Soloist itself advertises the WireGuard address, so phones could not find it for pairing); rewritten on every Soloist start |
 | `bin/streamer-soloist-update.sh`<br>`systemd/streamer-soloist-update.{service,timer}` | `/usr/local/bin/`<br>`/etc/systemd/system/` | Weekly Soloist re-download from soloist-builds.spotifycdn.com |
@@ -111,7 +111,7 @@ Soloist builds expire 90 days after their build date (exit code 10). `streamer-s
 | `bin/streamer-audio-default.sh` | `/usr/local/bin/` | Event-driven (`add <card>` / `remove` / `scan` all do the same): recompute the default card, update `/etc/asound.conf`, restart players once the target is openable |
 | `systemd/streamer-audio-default.service` | `/etc/systemd/system/` | Oneshot at boot, runs the script in `scan` mode after `sound.target` |
 | `udev/99-usb-audio.rules` | `/etc/udev/rules.d/` | Runs the script on sound-card add/remove events |
-| `mpd/mpd.conf` | `/etc/mpd.conf` | Music dir `/mnt/music_library`, bound to 0.0.0.0, `soxr` resampler (very high), ALSA output on `dmixer` fixed at 44100:16:2 with MPD hardware volume (`PCM`) |
+| `mpd/mpd.conf` | `/etc/mpd.conf` | Music dir `/mnt/music_library`, bound to 0.0.0.0, `soxr` resampler (very high), ALSA output on `dmixer` fixed at 44100:16:2 with MPD software volume |
 | `systemd/mnt-music-library.mount.d/10-rescan.conf` | `/etc/systemd/system/mnt-music-library.mount.d/` | Runs `mpc update` after every mount of the music library |
 | `systemd/mpd.service.d/10-after-audio-default.conf` | `/etc/systemd/system/mpd.service.d/` | Orders MPD after the audio-default scan |
 | `deploy/deploy_music_display.sh` | run on the box | Installs the now-playing display: Pillow framebuffer app, C RGB565 converter, config, systemd unit, cursor-blink drop-in. Backs up the old install and rolls back if the service does not stay up |
