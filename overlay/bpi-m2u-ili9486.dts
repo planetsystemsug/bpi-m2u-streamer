@@ -1,0 +1,32 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "sinovoip,bpi-m2-ultra", "allwinner,sun8i-r40";
+};
+
+&spi0 {
+    pinctrl-names = "default";
+    pinctrl-0 = <&spi0_pc_pins &spi0_cs0_pc_pin>;
+
+    status = "okay";
+
+    #address-cells = <1>;
+    #size-cells = <0>;
+
+    display@0 {
+        txbuflen = <32768>;
+        regwidth = <16>;
+        rotate = <90>;
+        compatible = "ilitek,ili9486";
+        reg = <0>;
+        spi-max-frequency = <16000000>;
+
+        buswidth = <8>;
+        fps = <30>;
+        bgr;
+
+        reset-gpios = <&pio 7 27 1>;
+        dc-gpios = <&pio 7 26 0>;
+    };
+};

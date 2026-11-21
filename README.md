@@ -115,6 +115,7 @@ Soloist builds expire 90 days after their build date (exit code 10). `streamer-s
 | `mpd/mpd.conf` | `/etc/mpd.conf` | Music dir `/mnt/music_library`, bound to 0.0.0.0, `soxr` resampler (very high), ALSA output on `dmixer` fixed at 44100:16:2 with MPD software volume |
 | `systemd/mnt-music-library.mount.d/10-rescan.conf` | `/etc/systemd/system/mnt-music-library.mount.d/` | Runs `mpc update` after every mount of the music library |
 | `systemd/mpd.service.d/10-after-audio-default.conf` | `/etc/systemd/system/mpd.service.d/` | Orders MPD after the audio-default scan |
+| `overlay/bpi-m2u-ili9486.dts` | `/boot/overlay-user/` (compiled to `.dtbo`) | Device tree overlay for the ILI9486 SPI panel (spi0, rotate 90, `bgr`); enabled with `user_overlays=bpi-m2u-ili9486` in `/boot/armbianEnv.txt` |
 | `deploy/deploy_music_display.sh` | run on the box | Installs the now-playing display: Pillow framebuffer app, C RGB565 converter, config, systemd unit, cursor-blink drop-in. Backs up the old install and rolls back if the service does not stay up |
 | `deploy/install_bootsplash.sh` | run on the box after the display is deployed | Quiet boot (serial console only), boot splash and its systemd service |
 | `deploy/tag_from_folders.py` | run on the box | Tags audio files with artist/album from `<Artist>/<Album>/file` folders |
@@ -182,6 +183,14 @@ systemctl enable --now mpd avahi-daemon streamer-audio-default \
 # music dir (must be world-readable)
 mkdir -p /mnt/music_library
 
+# display overlay (see "Display"), then reboot before the next two steps
+install -d /boot/overlay-user
+cp overlay/bpi-m2u-ili9486.dts /boot/overlay-user/
+dtc -@ -I dts -O dtb -o /boot/overlay-user/bpi-m2u-ili9486.dtbo \
+    /boot/overlay-user/bpi-m2u-ili9486.dts
+grep -q '^user_overlays=' /boot/armbianEnv.txt \
+    || echo 'user_overlays=bpi-m2u-ili9486' >> /boot/armbianEnv.txt
+
 # display + boot splash (see "Display")
 bash deploy/deploy_music_display.sh
 bash deploy/install_bootsplash.sh
@@ -233,6 +242,10 @@ bash deploy/install_bootsplash.sh     # quiet boot + splash; reboot afterwards
 ```
 
 `deploy_music_display.sh` expects a working `fb_ili9486` framebuffer at exactly 480x320 @ 16 bpp and refuses to install otherwise. It never touches the device tree, SPI, GPIO, overlays or kernel modules. If the new service does not stay active it restores the previous installation from `/var/backups/music-display-<timestamp>`.
+
+### Panel overlay and colours
+
+The panel is described by `overlay/bpi-m2u-ili9486.dts` (install steps above; the deploy scripts never touch it). The `bgr;` property is required: this panel is wired BGR, and without it red and blue are swapped (a pure-red frame, `0xF800` in RGB565, shows blue). The framebuffer reports standard RGB565, so the app and the C converter need no channel swap. After changing the overlay, recompile the `.dtbo` and reboot.
 
 ### What it shows
 
