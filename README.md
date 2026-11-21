@@ -25,6 +25,7 @@
 - [Installation (fresh box)](#installation-fresh-box)
 - [Spotify setup](#spotify-setup-one-time-per-controlling-account)
 - [Local music](#local-music)
+- [Qobuz](#qobuz)
 - [Display](#display)
 - [Remote control](#remote-control-ir)
 - [Power-off](#power-off)
@@ -120,6 +121,8 @@ Soloist builds expire 90 days after their build date (exit code 10). `streamer-s
 | `overlay/bpi-m2u-ili9486.dts` | `/boot/overlay-user/` (compiled to `.dtbo`) | Device tree overlay for the ILI9486 SPI panel (spi0, rotate 90, `bgr`) and its touch controller (spidev at CS1); enabled with `user_overlays=bpi-m2u-ili9486` in `/boot/armbianEnv.txt` |
 | `bin/streamer-ir`<br>`systemd/streamer-ir.service`<br>`default/streamer-ir.json` | `/usr/local/bin/`<br>`/etc/systemd/system/`<br>`/etc/streamer-ir.json` (kept if present) | IR remote control: scancodes from the SoC's IR receiver to MPD / Spotify actions |
 | `modules-load.d/spidev.conf` | `/etc/modules-load.d/` | Loads `spidev` at boot for the touch controller |
+| `upmpdcli/upmpdcli.conf` | `/etc/upmpdcli.conf` | UPnP/OpenHome renderer in front of MPD, Qobuz plugin enabled (FLAC 16/44.1), UPnP bound to `wlan0`; no credentials |
+| `deploy/install_upmpdcli.sh` | run on the box | Adds the upmpdcli apt repo, builds upmpdcli for armhf, installs it with the Qobuz plugin and the config |
 | `deploy/deploy_music_display.sh` | run on the box | Installs the now-playing display: Pillow framebuffer app, C RGB565 converter, config, systemd unit, cursor-blink drop-in. Backs up the old install and rolls back if the service does not stay up |
 | `deploy/install_bootsplash.sh` | run on the box after the display is deployed | Quiet boot (serial console only), boot splash and its systemd service |
 | `deploy/tag_from_folders.py` | run on the box | Tags audio files with artist/album from `<Artist>/<Album>/file` folders |
@@ -237,6 +240,22 @@ mpc update
 Re-run it after copying new music into the library. Album art is picked up from `cover.jpg` in each album folder (MPD's default `album_art_names`).
 
 When the library is mounted, systemd runs `mpc update` through the drop-in in `systemd/mnt-music-library.mount.d/`, so new music shows up without manual rescans. With `x-systemd.automount` the mount activates on first access, which MPD's periodic scan of its music dir triggers.
+
+## Qobuz (optional, experimental)
+
+Not part of the default install and not enabled on the reference box. MPD 0.24 has no Qobuz plugin and Qobuz has no Connect client for Linux, so the only route found is **upmpdcli**: a UPnP/OpenHome renderer in front of MPD plus a Qobuz browser. Limits to know before trying it:
+
+- The **official Qobuz app cannot see the streamer** (it only lists licensed Qobuz Connect devices). You need a third-party UPnP control app (BubbleUPnP, Linn Kazoo, mConnect) as a second app next to Spotify and your MPD client.
+- Qobuz plays through MPD, so "last one started wins" with Spotify applies as for local files, but a Qobuz queue replaces MPD's queue. Display metadata and the touch button with Qobuz were not tested.
+- Tested only as far as installing, logging in and discovery on the LAN; no track was played.
+
+`deploy/install_upmpdcli.sh` adds the upmpdcli apt repo, builds libnpupnp, libupnpp and upmpdcli from source (the repo has no armhf build of the core packages for trixie; about an hour on the A7), installs them with the Qobuz plugin and `upmpdcli/upmpdcli.conf` (FLAC 16/44.1, UPnP bound to `wlan0`; change `upnpiface` for Ethernet). The script as a whole was not run end to end. Log in once with OAuth, so no password is stored on the box:
+
+```bash
+python3 /usr/share/upmpdcli/cdplugins/qobuz/qobuz-init-oauth.py
+```
+
+Open the printed URL that contains the box's LAN address in a browser on the same network.
 
 ## Display
 
