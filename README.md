@@ -272,9 +272,10 @@ The watcher rewrites the state file every 30 s while a session is playing or pau
 
 ### Idle screen
 
-After `idle_clear_seconds` (default **300 s**) in a *paused or stopped* state, the display switches from the track view to an idle screen: a 96x96 circular BPi M2U logo bouncing around on a black background (the screen is not simply blanked). It animates at about 2.5 FPS (one frame every 0.4 s), moving at roughly 42 px/s horizontally and 30 px/s vertically, and reflects off the screen edges.
+After `idle_clear_seconds` (default **180 s**) in a *paused or stopped* state, the display switches from the track view to an idle screen: a 96x96 circular BPi M2U logo bouncing around on a black background (the screen is not simply blanked). It animates at about 2.5 FPS (one frame every 0.4 s), moving at roughly 42 px/s horizontally and 30 px/s vertically, and reflects off the screen edges.
 
 - The timer starts when the state becomes paused or stopped. Switching between the two does not restart it.
+- A tap anywhere on the touch panel leaves the idle screen, shows the track view (with the play/pause button) again and restarts the idle timer. The waking tap does not toggle playback.
 - Any change back to *playing* leaves the idle screen and forces a full redraw of the track view.
 - Setting `idle_clear_seconds` to `0` starts the animation immediately on any pause or stop.
 - Edit `/etc/music-display/config.json` and `systemctl restart music-display` to change it. Re-running `deploy_music_display.sh` keeps an existing config and only adds missing keys.
@@ -285,7 +286,7 @@ Default config:
 {
   "source": "auto",
   "poll_seconds": 2.0,
-  "idle_clear_seconds": 300,
+  "idle_clear_seconds": 180,
   "mpd": { "host": "127.0.0.1", "port": 6600, "password": "" },
   "spotify_state": "/var/lib/music-display/spotify.json"
 }

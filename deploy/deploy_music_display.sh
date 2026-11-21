@@ -568,6 +568,7 @@ def placeholder_art(size=190):
 BTN_CX, BTN_CY, BTN_R = 436, 244, 22          # right side, above the timeline
 BTN_HIT = 34                                  # generous touch target (px radius)
 wake = threading.Event()
+tap_event = threading.Event()                 # any touch: wake the idle screen
 touch_state = {'visible': False, 'source': '', 'state': 'stop'}
 
 
@@ -699,6 +700,7 @@ def touch_thread(cfg):
                     py = (1 - fy if inv_y else fy) * HEIGHT
                     if debug:
                         print(f'Touch raw={last} -> {px:.0f},{py:.0f}', flush=True)
+                    tap_event.set()
                     if (touch_state['visible'] and abs(px - BTN_CX) <= BTN_HIT
                             and abs(py - BTN_CY) <= BTN_HIT):
                         toggle_playback(cfg)
@@ -792,7 +794,7 @@ def render(snapshot, art, now):
 def main():
     cfg = read_config()
     poll = max(0.5, min(5.0, float(cfg.get('poll_seconds', 1.0))))
-    idle_clear_seconds = max(0.0, float(cfg.get('idle_clear_seconds', 300)))
+    idle_clear_seconds = max(0.0, float(cfg.get('idle_clear_seconds', 180)))
     fb = Framebuffer('/dev/fb0')
     print(f'Framebuffer ready: {fb.width}x{fb.height}, {fb.bpp} bpp, stride={fb.stride}', flush=True)
     last_key, art, last_art_attempt = None, None, 0.0
@@ -827,6 +829,19 @@ def main():
 
             state = str(snapshot.get('state', 'stop')).lower()
             touch_state.update(source=str(snapshot.get('source') or '').lower(), state=state, visible=False)
+
+            # A tap anywhere leaves the idle screen and restarts the idle timer,
+            # so play can be pressed again after a stop/pause.
+            if tap_event.is_set():
+                tap_event.clear()
+                if idle_since is not None:
+                    idle_since = now
+                if screen_cleared:
+                    screen_cleared = False
+                    idle_logo = None
+                    idle_last_frame = 0.0
+                    last_render_key = None
+                    print('Display woken by touch', flush=True)
 
             # Start the idle timer when playback enters stopped state.
             if state in ('stop', 'pause'):
@@ -947,7 +962,7 @@ if [[ ! -e "$CFG" ]]; then
 {
   "source": "auto",
   "poll_seconds": 2.0,
-  "idle_clear_seconds": 300,
+  "idle_clear_seconds": 180,
   "mpd": {
     "host": "127.0.0.1",
     "port": 6600,
@@ -964,7 +979,7 @@ from pathlib import Path
 import sys
 p = Path(sys.argv[1])
 cfg = json.loads(p.read_text())
-cfg.setdefault("idle_clear_seconds", 300)
+cfg.setdefault("idle_clear_seconds", 180)
 # Migrate the pre-Soloist key (librespot.json is no longer written by anything).
 legacy = cfg.pop("librespot_state", None)
 if legacy and "spotify_state" not in cfg:
@@ -1076,6 +1091,6 @@ echo
 echo "Spotify: state is written to /var/lib/music-display/spotify.json by"
 echo "/usr/local/bin/streamer-soloist-event (Soloist event watcher)."
 echo
-echo "Idle behaviour: pause/stop = circular 96x96 BPi M2U logo bouncing on black after configured timeout (default 300s)."
+echo "Idle behaviour: pause/stop = circular 96x96 BPi M2U logo bouncing on black after configured timeout (default 180s)."
 echo "Animation cadence: approximately 2.5 FPS; normal display is restored when playback resumes."
 echo "The working FBTFT overlay, SPI, GPIO and kernel driver were not modified."

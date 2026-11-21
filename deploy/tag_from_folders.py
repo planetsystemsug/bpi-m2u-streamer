@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Tag audio files with artist/album derived from folder structure.
 
+The title is taken from the file name without extension, but only if the
+file has no title yet (existing titles are never overwritten). A leading
+track number ("01 - Name", "1. Name") becomes the track number tag (also
+only if missing) and is stripped from the title. Without a
+title tag MPD clients show the bare file name including ".flac" etc.
+
 Expected layout: <root>/<Artist>/<Album>/[subdirs/]track.flac
 
 Usage: tag_from_folders.py [--dry-run] [--albumartist] [root]
@@ -14,6 +20,7 @@ change, no needless MPD rescan). Errors on single files are reported and
 do not abort the run. Needs python3-mutagen.
 """
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -22,23 +29,44 @@ from mutagen import MutagenError
 AUDIO_EXTS = {".flac", ".mp3", ".m4a", ".mp4", ".ogg", ".opus"}
 
 
+# Keys that are only filled in when missing, never overwritten.
+FILL_ONLY = {"title", "track"}
+
+# "01 - Name", "1. Name", "07_Name", "03) Name" -> (track number, name)
+TRACK_RE = re.compile(r"^(\d{1,3})\s*[-._)]+\s*(\S.*)$")
+
+
+def title_and_track(stem):
+    m = TRACK_RE.match(stem)
+    if m:
+        return m.group(2).strip(), str(int(m.group(1)))
+    return stem, None
+
+
 def _vorbis_like(f, wanted):
     """FLAC / Ogg Vorbis / Opus: dict of lowercase key -> list of str."""
     changed = False
     for key, value in wanted.items():
-        if list(f.get(key, [])) != [value]:
-            f[key] = [value]
+        vkey = "tracknumber" if key == "track" else key
+        cur = list(f.get(vkey, []))
+        if key in FILL_ONLY and any(cur):
+            continue
+        if cur != [value]:
+            f[vkey] = [value]
             changed = True
     return changed
 
 
 def _mp3(tags, wanted):
-    from mutagen.id3 import TALB, TPE1, TPE2
-    frames = {"artist": TPE1, "album": TALB, "albumartist": TPE2}
+    from mutagen.id3 import TALB, TIT2, TPE1, TPE2, TRCK
+    frames = {"artist": TPE1, "album": TALB, "albumartist": TPE2, "title": TIT2,
+              "track": TRCK}
     changed = False
     for key, value in wanted.items():
         cls = frames[key]
         cur = tags.get(cls.__name__)
+        if key in FILL_ONLY and cur is not None and any(cur.text):
+            continue
         if cur is None or list(cur.text) != [value]:
             tags.setall(cls.__name__, [cls(encoding=3, text=[value])])
             changed = True
@@ -46,11 +74,21 @@ def _mp3(tags, wanted):
 
 
 def _mp4(f, wanted):
-    atoms = {"artist": "\xa9ART", "album": "\xa9alb", "albumartist": "aART"}
+    atoms = {"artist": "\xa9ART", "album": "\xa9alb", "albumartist": "aART",
+             "title": "\xa9nam", "track": "trkn"}
     changed = False
     for key, value in wanted.items():
         atom = atoms[key]
-        if list(f.get(atom, [])) != [value]:
+        cur = list(f.get(atom, []))
+        if key == "track":
+            if any(t[0] for t in cur):
+                continue
+            f[atom] = [(int(value), 0)]
+            changed = True
+            continue
+        if key in FILL_ONLY and any(cur):
+            continue
+        if cur != [value]:
             f[atom] = [value]
             changed = True
     return changed
@@ -150,7 +188,11 @@ def main():
         if len(rel.parts) < 3:
             skipped.append(str(rel))
             continue
-        wanted = {"artist": rel.parts[0], "album": rel.parts[1]}
+        title, track = title_and_track(p.stem)
+        wanted = {"artist": rel.parts[0], "album": rel.parts[1],
+                  "title": title}
+        if track:
+            wanted["track"] = track
         if albumartist:
             wanted["albumartist"] = rel.parts[0]
         try:
