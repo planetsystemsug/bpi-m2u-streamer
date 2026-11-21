@@ -115,6 +115,7 @@ chmod 0644 "$SRC" "$LIB"
 cat > "$APP" <<'PYAPP'
 #!/usr/bin/python3
 import ctypes
+import errno
 import fcntl
 import hashlib
 import io
@@ -126,6 +127,7 @@ import struct
 import sys
 import time
 import urllib.request
+from array import array
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
@@ -205,11 +207,6 @@ class Framebuffer:
             raise RuntimeError(f'Invalid framebuffer line_length: {self.stride}')
         if not (self.var.red.length and self.var.green.length and self.var.blue.length):
             raise RuntimeError('Framebuffer RGB bitfields are not available')
-        try:
-            fcntl.ioctl(self.fd, FBIOBLANK, struct.pack('i', 0))
-        except OSError as exc:
-            print(f'Framebuffer blank ioctl unsupported; continuing: {exc}', flush=True)
-
         self._converter_lib = ctypes.CDLL('/opt/music-display/libfbconvert.so')
         self._convert_rgb565 = self._converter_lib.rgb888_to_fb
         self._convert_rgb565.argtypes = [
@@ -218,13 +215,28 @@ class Framebuffer:
             *([ctypes.c_uint] * 9),
         ]
         self._convert_rgb565.restype = None
+        try:
+            fcntl.ioctl(self.fd, FBIOBLANK, struct.pack('i', 0))
+        except OSError as exc:
+            if exc.errno not in (errno.EINVAL, errno.ENOTTY):
+                raise
+            print(f'Framebuffer blank ioctl unsupported; continuing: {exc}', file=sys.stderr, flush=True)
+
+    @staticmethod
+    def _component(value, field):
+        length = int(field.length)
+        maximum = (1 << length) - 1
+        scaled = (value * maximum + 127) // 255
+        if field.msb_right:
+            bits = f'{scaled:0{length}b}'
+            scaled = int(bits[::-1], 2)
+        return scaled << int(field.offset)
 
     def show(self, image):
         image = image.convert('RGB')
+        image = image.transpose(Image.Transpose.ROTATE_180)
         if image.size != (self.width, self.height):
             image = image.resize((self.width, self.height), Image.Resampling.LANCZOS)
-        # Rotate the complete framebuffer image 180 degrees in software.
-        image = image.transpose(Image.Transpose.ROTATE_180)
         source = image.tobytes()
         frame = bytearray(self.stride * self.height)
         source_ptr = ctypes.cast(ctypes.c_char_p(source), ctypes.c_void_p)
@@ -336,7 +348,7 @@ def mpd_snapshot(cfg):
         title = Path(file_name).name
     artist = ', '.join(song.get('Artist', []) or song.get('AlbumArtist', []))
     album = get(song, 'Album')
-    key = get(song, 'Id') or file_name or f'{title}|{artist}|{album}'
+    key = file_name or get(song, 'Id') or f'{title}|{artist}|{album}'
     return {
         'source': 'MPD', 'state': state, 'title': title or 'Unknown track',
         'artist': artist, 'album': album, 'duration': max(0.0, duration),
@@ -431,13 +443,14 @@ def select_snapshot(cfg):
             pass
     if source == 'mpd':
         return mpd or idle_snapshot()
-    if source in ('auto', 'spotify'):
-        spotify = read_spotify_state(cfg.get('spotify_state', str(STATE_PATH)))
+    if source in ('auto', 'librespot', 'spotify'):
+        # 'librespot_state' is the pre-Soloist config key; still honoured.
+        spotify = read_spotify_state(cfg.get('spotify_state') or cfg.get('librespot_state') or str(STATE_PATH))
         if source != 'auto':
             return spotify or idle_snapshot()
         if spotify and spotify.get('state') == 'play':
             return spotify
-        if mpd and mpd.get('state') in ('play', 'pause'):
+        if mpd and mpd.get('state') == 'play':
             return mpd
         if spotify and spotify.get('state') in ('play', 'pause'):
             return spotify
@@ -504,47 +517,6 @@ def font(path, size):
 
 FONT_REG = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
 FONT_BOLD = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'
-
-
-def create_idle_logo(size=96):
-    # Recreate the exact central artwork from boot_splash.py (crop 110,42 to 370,302).
-    # The original splash gradient is retained inside the circular logo.
-    logo = Image.new('RGB', (260, 260), '#000000')
-    draw = ImageDraw.Draw(logo)
-
-    for y in range(260):
-        global_y = y + 42
-        t = global_y / 320
-        color = (
-            int(8 + 7 * t),
-            int(15 + 13 * t),
-            int(29 + 19 * t),
-        )
-        draw.line((0, y, 259, y), fill=color)
-
-    draw.ellipse((0, 0, 260, 260), outline='#203B50', width=2)
-    draw.ellipse((18, 18, 242, 242), outline='#1B3448', width=1)
-
-    cx, cy = 130, 73
-    heights = [15, 28, 43, 57, 43, 28, 15]
-    for i, height in enumerate(heights):
-        x = cx - 42 + i * 14
-        draw.rounded_rectangle(
-            (x, cy - height // 2, x + 6, cy + height // 2),
-            radius=3,
-            fill='#63D8B6',
-        )
-
-    title = font(FONT_BOLD, 29)
-    subtitle = font(FONT_BOLD, 19)
-    draw.text((130, 138), 'BPi M2U', font=title, fill='#F0F4FA', anchor='mm')
-    draw.text((130, 169), 'STREAMER', font=subtitle, fill='#63D8B6', anchor='mm')
-
-    mask = Image.new('L', (260, 260), 0)
-    ImageDraw.Draw(mask).ellipse((0, 0, 259, 259), fill=255)
-    result = logo.convert('RGBA')
-    result.putalpha(mask)
-    return result.resize((size, size), Image.Resampling.LANCZOS)
 
 
 def wrap_lines(draw, text, fnt, max_width, max_lines=2):
@@ -664,7 +636,7 @@ def render(snapshot, art, now):
 
 def main():
     cfg = read_config()
-    poll = max(0.5, min(5.0, float(cfg.get('poll_seconds', 2.0))))
+    poll = max(0.5, min(5.0, float(cfg.get('poll_seconds', 1.0))))
     idle_clear_seconds = max(0.0, float(cfg.get('idle_clear_seconds', 300)))
     fb = Framebuffer('/dev/fb0')
     print(f'Framebuffer ready: {fb.width}x{fb.height}, {fb.bpp} bpp, stride={fb.stride}', flush=True)
@@ -676,7 +648,6 @@ def main():
     idle_x = idle_y = 0.0
     idle_vx, idle_vy = 42.0, 30.0
     idle_last_frame = 0.0
-    idle_frame_interval = 0.4  # 2.5 FPS
     running = True
 
     def stop_signal(_sig, _frame):
@@ -691,36 +662,52 @@ def main():
             started = time.monotonic()
             snapshot = select_snapshot(cfg)
             now = time.monotonic()
+            key = snapshot.get('track_key') or 'idle'
+
+            if key != last_key or (art is None and now - last_art_attempt > 15):
+                last_art_attempt = now
+                art = load_art(snapshot, cfg) if snapshot.get('title') else None
+                last_key = key
+
             state = str(snapshot.get('state', 'stop')).lower()
 
-            # Only load artwork while a track is active or paused.
-            key = snapshot.get('track_key') or 'idle'
-            if state != 'stop':
-                if key != last_key or (art is None and now - last_art_attempt > 15):
-                    last_art_attempt = now
-                    art = load_art(snapshot, cfg) if snapshot.get('title') else None
-                    last_key = key
-
-            # Animate the circular boot logo after the timeout in both pause and stop.
+            # Start the idle timer when playback enters stopped state.
             if state in ('stop', 'pause'):
                 if idle_since is None:
                     idle_since = now
 
+                # Animate the boot logo after the configured idle timeout.
                 if now - idle_since >= idle_clear_seconds:
                     if not screen_cleared:
-                        idle_logo = create_idle_logo(96)
+                        from boot_splash import create_splash
+
+                        # Extract the original circular BPi M2U artwork.
+                        splash = create_splash()
+                        logo_crop = splash.crop((110, 42, 370, 302)).convert('RGB')
+
+                        # Mask the square crop into a circle.
+                        logo_mask = Image.new('L', (260, 260), 0)
+                        ImageDraw.Draw(logo_mask).ellipse(
+                            (0, 0, 259, 259), fill=255
+                        )
+
+                        idle_logo = Image.new('RGB', (260, 260), '#000000')
+                        idle_logo.paste(logo_crop, (0, 0), logo_mask)
+                        idle_logo.thumbnail((96, 96), Image.Resampling.LANCZOS)
+
                         idle_x = (WIDTH - idle_logo.width) / 2
                         idle_y = (HEIGHT - idle_logo.height) / 2
                         idle_last_frame = 0.0
                         screen_cleared = True
                         print(
-                            f'Idle BPi M2U logo animation started: '
-                            f'{idle_logo.width}x{idle_logo.height}',
-                            flush=True,
+                            f'Idle logo animation started: {idle_logo.width}x{idle_logo.height}',
+                            flush=True
                         )
 
-                    if idle_last_frame == 0.0 or now - idle_last_frame >= idle_frame_interval:
+                    # Limit framebuffer updates to approximately 2.5 FPS.
+                    if idle_last_frame == 0.0 or now - idle_last_frame >= 0.4:
                         dt = min(max(now - idle_last_frame, 0.0), 0.5) if idle_last_frame else 0.0
+
                         idle_x += idle_vx * dt
                         idle_y += idle_vy * dt
 
@@ -742,15 +729,17 @@ def main():
                             idle_vy = -abs(idle_vy)
 
                         frame = Image.new('RGB', (WIDTH, HEIGHT), '#000000')
-                        frame.paste(idle_logo, (int(idle_x), int(idle_y)), idle_logo)
+                        frame.paste(idle_logo, (int(idle_x), int(idle_y)))
                         fb.show(frame)
-                        idle_last_frame = time.monotonic()
+                        idle_last_frame = now
 
-                    # Keep framebuffer updates and MPD polling near 2.5 FPS while animating.
-                    time.sleep(max(0.05, idle_frame_interval - (time.monotonic() - idle_last_frame)))
+                    elapsed = time.monotonic() - started
+                    time.sleep(max(0.05, poll - elapsed))
                     continue
             else:
                 idle_since = None
+
+                # Force a complete redraw when playback resumes or is paused.
                 if screen_cleared:
                     screen_cleared = False
                     idle_logo = None
@@ -764,6 +753,7 @@ def main():
                 snapshot.get('title'), snapshot.get('artist'), snapshot.get('album'),
                 bool(art), position_bucket,
             )
+
             if render_key != last_render_key:
                 snapshot['_position_monotonic'] = time.monotonic()
                 fb.show(render(snapshot, art, time.monotonic()))
@@ -777,7 +767,6 @@ def main():
 
 if __name__ == '__main__':
     main()
-
 PYAPP
 
 chmod 0755 "$APP"
