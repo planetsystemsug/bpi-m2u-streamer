@@ -1,0 +1,8 @@
+# Settings for streamer-audio-default.sh (sourced by it).
+#
+# DAC PCM volume (percent) applied when the USB card is activated. Keep it
+# below 100: the DAC's PCM control is reported as 0..+16 dB, so high settings
+# may add digital gain and clip. Set the loudness on the amplifier instead.
+# Re-check after changing the DAC/amplifier. MPD's volume slider still moves
+# it at runtime.
+PCM_VOLUME=60

@@ -21,6 +21,9 @@
 # behind each other (which at boot can stall everything for minutes).
 ACTION="$1"; CARD="${2:-}"; CARD="${CARD#card}"
 
+PCM_VOLUME=60
+[ -r /etc/default/streamer-audio ] && . /etc/default/streamer-audio
+
 exec 9>/run/streamer-audio.lock || exit 0
 
 is_usb_card() { readlink -f "/sys/class/sound/card$1/device" 2>/dev/null | grep -q "usb"; }
@@ -74,7 +77,7 @@ marker="$(cat "$marker_file" 2>/dev/null)"
 if [ "$marker" != "${target:-onboard}" ]; then
     logger -t streamer-audio "restarting players for ${target:-onboard}"
     if [ -n "$target" ]; then
-        amixer -c "$target" sset PCM 80% >/dev/null 2>&1 || true
+        amixer -c "$target" sset PCM "${PCM_VOLUME}%" >/dev/null 2>&1 || true
     fi
     systemctl try-restart streamer-pulseaudio 2>/dev/null || true
     systemctl try-restart mpd soloist 2>/dev/null || true

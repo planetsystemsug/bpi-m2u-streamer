@@ -68,7 +68,7 @@ Two independent players share one ALSA card via `dmix`:
 
 ### Audio routing
 
-`streamer-audio-default.sh` keeps `/etc/asound.conf` pointing at the USB sound card when present and at onboard audio otherwise. It sets the card's PCM volume to 80% on activation.
+`streamer-audio-default.sh` keeps `/etc/asound.conf` pointing at the USB sound card when present and at onboard audio otherwise. It sets the card's PCM volume to `PCM_VOLUME` percent (default 60, from `/etc/default/streamer-audio`) on activation.
 
 udev fires one event per sound subdevice in no guaranteed order. The card event can arrive long before the driver has registered its PCM devices, and before udev fixes `/dev/snd` permissions from root:root 600 to root:audio 660. So every event recomputes the desired default from what is actually present:
 
@@ -86,7 +86,7 @@ The USB DAC (SMSL) is a USB 1.1 full-speed, adaptive device: **16-bit, 44.1 or 4
 - dmix runs at **44.1 kHz / S16_LE**, native for CD material and Spotify. A single 44.1 kHz/16-bit stream passes through unchanged.
 - Higher rates or depths (e.g. 88.2 kHz/24-bit FLAC) are converted once by MPD's `soxr` "very high" resampler and dithered to 16 bit. About 8% CPU on the A7 at 88.2 kHz.
 - Spotify (44.1 kHz) reaches the same dmix with no resampling; PulseAudio uses `soxr-vhq` should a client ever differ.
-- MPD's volume control is the DAC's hardware `PCM` control (no digital attenuation in software). The audio script sets it to 80% when a card is activated.
+- MPD's volume control is the DAC's hardware `PCM` control (no digital attenuation in software). The audio script sets it to `PCM_VOLUME` (60% by default) when a card is activated. The DAC reports its PCM range as 0 to +16 dB, so high settings may clip digitally; keep it moderate and set loudness on the amplifier. Re-check this value when the DAC or amplifier changes.
 
 ### Spotify vs. MPD: last one started wins
 
@@ -106,6 +106,7 @@ Soloist builds expire 90 days after their build date (exit code 10). `streamer-s
 | `systemd/soloist.service` | `/etc/systemd/system/` | Runs Soloist as user `soloist`, name "BPi-M2U-Streamer", data dir `/var/lib/soloist`, 1 GB cache, initial volume 80%, WebSocket API on 127.0.0.1:8934; clears the MPD-paused flag on start |
 | `bin/streamer-soloist-event`<br>`systemd/streamer-soloist-event.service` | `/usr/local/bin/`<br>`/etc/systemd/system/` | Spotify priority (pause/resume MPD) and display state file `/var/lib/music-display/spotify.json` |
 | `bin/streamer-soloist-update.sh`<br>`systemd/streamer-soloist-update.{service,timer}` | `/usr/local/bin/`<br>`/etc/systemd/system/` | Weekly Soloist re-download from soloist-builds.spotifycdn.com |
+| `default/streamer-audio` | `/etc/default/streamer-audio` | `PCM_VOLUME` (DAC volume applied on card activation, default 60) |
 | `bin/streamer-audio-default.sh` | `/usr/local/bin/` | Event-driven (`add <card>` / `remove` / `scan` all do the same): recompute the default card, update `/etc/asound.conf`, restart players once the target is openable |
 | `systemd/streamer-audio-default.service` | `/etc/systemd/system/` | Oneshot at boot, runs the script in `scan` mode after `sound.target` |
 | `udev/99-usb-audio.rules` | `/etc/udev/rules.d/` | Runs the script on sound-card add/remove events |
@@ -162,6 +163,7 @@ install -m755 bin/streamer-soloist-update.sh /usr/local/bin/
 install -d -o soloist -g audio /var/lib/streamer
 cp pulse/system.pa pulse/daemon.conf /etc/pulse/
 cp mpd/mpd.conf /etc/mpd.conf
+cp default/streamer-audio /etc/default/streamer-audio
 cp systemd/*.service systemd/*.timer /etc/systemd/system/
 install -Dm644 systemd/mnt-music-library.mount.d/10-rescan.conf \
     /etc/systemd/system/mnt-music-library.mount.d/10-rescan.conf
@@ -285,7 +287,7 @@ soloist ctl now --json                  # Soloist state
 
 As of 2026-11-20:
 
-- MPD plays a test tone through the SMSL USB amp via ALSA (heard at 80% volume).
+- MPD plays a test tone through the SMSL USB amp via ALSA (heard at 80% volume, before the default became 60%).
 - udev hotplug and the boot scan set the amp card as default output. Unplugging while playing falls back to onboard; plugging in while playing switches to the amp and MPD resumes on it.
 - PulseAudio system mode serves `soloist-sink` on the active card; a 440 Hz tone played through the amp as user `soloist` via `/run/pulse/native`.
 - Spotify Connect end to end: paired "BPi-M2U-Streamer" from the phone app and streamed through the amp (Soloist v1.4.0.2 arm32). The update timer keeps the build fresh.
