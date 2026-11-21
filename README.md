@@ -115,7 +115,9 @@ Soloist builds expire 90 days after their build date (exit code 10). `streamer-s
 | `mpd/mpd.conf` | `/etc/mpd.conf` | Music dir `/mnt/music_library`, bound to 0.0.0.0, `soxr` resampler (very high), ALSA output on `dmixer` fixed at 44100:16:2 with MPD software volume |
 | `systemd/mnt-music-library.mount.d/10-rescan.conf` | `/etc/systemd/system/mnt-music-library.mount.d/` | Runs `mpc update` after every mount of the music library |
 | `systemd/mpd.service.d/10-after-audio-default.conf` | `/etc/systemd/system/mpd.service.d/` | Orders MPD after the audio-default scan |
-| `overlay/bpi-m2u-ili9486.dts` | `/boot/overlay-user/` (compiled to `.dtbo`) | Device tree overlay for the ILI9486 SPI panel (spi0, rotate 90, `bgr`); enabled with `user_overlays=bpi-m2u-ili9486` in `/boot/armbianEnv.txt` |
+| `systemd/mpd.service.d/20-volume.conf` | `/etc/systemd/system/mpd.service.d/` | Sets MPD's software volume to 85% on every start (MPD only saves it on a clean shutdown, so it came back at 100% after a power-off) |
+| `overlay/bpi-m2u-ili9486.dts` | `/boot/overlay-user/` (compiled to `.dtbo`) | Device tree overlay for the ILI9486 SPI panel (spi0, rotate 90, `bgr`) and its touch controller (spidev at CS1); enabled with `user_overlays=bpi-m2u-ili9486` in `/boot/armbianEnv.txt` |
+| `modules-load.d/spidev.conf` | `/etc/modules-load.d/` | Loads `spidev` at boot for the touch controller |
 | `deploy/deploy_music_display.sh` | run on the box | Installs the now-playing display: Pillow framebuffer app, C RGB565 converter, config, systemd unit, cursor-blink drop-in. Backs up the old install and rolls back if the service does not stay up |
 | `deploy/install_bootsplash.sh` | run on the box after the display is deployed | Quiet boot (serial console only), boot splash and its systemd service |
 | `deploy/tag_from_folders.py` | run on the box | Tags audio files with artist/album from `<Artist>/<Album>/file` folders |
@@ -246,6 +248,12 @@ bash deploy/install_bootsplash.sh     # quiet boot + splash; reboot afterwards
 ### Panel overlay and colours
 
 The panel is described by `overlay/bpi-m2u-ili9486.dts` (install steps above; the deploy scripts never touch it). The `bgr;` property is required: this panel is wired BGR, and without it red and blue are swapped (a pure-red frame, `0xF800` in RGB565, shows blue). The framebuffer reports standard RGB565, so the app and the C converter need no channel swap. After changing the overlay, recompile the `.dtbo` and reboot.
+
+### Touch play/pause button
+
+The panel shield's XPT2046/ADS7846 touch controller is used from the display app, not from the kernel's `ads7846` driver: its pen interrupt is on PI20 (header pin 11), which has no interrupt function on this SoC, and its natural chip select (SPI0 CS1 = PC24) belongs to the eMMC. Instead the overlay declares a plain `spidev` device at CS1 (`/dev/spidev0.1`, module loaded via `modules-load.d/spidev.conf`), and `music_display.py` switches PH24 (header pin 26, the shield's CE1) as chip select, polls PI20 for finger-down and reads the chip over SPI.
+
+A round play/pause button is drawn at the right, above the timeline. Tapping it pauses/resumes MPD (`pause`/`play`) or Spotify (`soloist ctl pause|play`, which needs Soloist running), depending on the active source; each tap is logged in the journal. Calibration is under `touch` in `/etc/music-display/config.json`: `swap_xy`, `invert_x`, `invert_y`, `x_min`/`x_max`/`y_min`/`y_max` (raw chip values at the screen edges; with `swap_xy` the raw y range maps to screen x), `enabled`, and `debug` (logs every tap's raw reading and mapped position, for recalibrating with a stylus on the four corners). Overlay or module changes need a reboot.
 
 ### What it shows
 

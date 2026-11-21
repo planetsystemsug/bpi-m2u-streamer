@@ -29,4 +29,18 @@
         reset-gpios = <&pio 7 27 1>;
         dc-gpios = <&pio 7 26 0>;
     };
+
+    /* Touch controller of the panel shield (XPT2046 / ADS7846 compatible),
+     * exposed as /dev/spidev0.1 and driven by the display app. The kernel's
+     * ads7846 driver cannot be used: its pen IRQ is on PI20 (header pin 11),
+     * which has no interrupt function on this SoC. The chip select (header
+     * pin 26) is PH24, switched as a plain GPIO by the app, so SPI0's own
+     * CS1 (PC24, owned by the eMMC) is not used. The app also polls PI20 for
+     * "finger down". "rohm,dh2228fv" is just a compatible the spidev driver
+     * accepts. */
+    touch@1 {
+        compatible = "rohm,dh2228fv";
+        reg = <1>;
+        spi-max-frequency = <2000000>;
+    };
 };

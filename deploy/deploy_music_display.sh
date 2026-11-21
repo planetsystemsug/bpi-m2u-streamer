@@ -124,7 +124,9 @@ import os
 import signal
 import socket
 import struct
+import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from array import array
@@ -561,6 +563,151 @@ def placeholder_art(size=190):
     return im
 
 
+# --- Touch play/pause button -------------------------------------------------
+BTN_CX, BTN_CY, BTN_R = 436, 244, 22          # right side, above the timeline
+BTN_HIT = 34                                  # generous touch target (px radius)
+wake = threading.Event()
+touch_state = {'visible': False, 'source': '', 'state': 'stop'}
+
+
+def toggle_playback(cfg):
+    source = str(touch_state['source']).lower()
+    playing = touch_state['state'] == 'play'
+    print(f'Button tap: source={source or "none"} state={touch_state["state"]}', flush=True)
+    try:
+        if source == 'mpd':
+            sock, reader = mpd_open(cfg)
+            try:
+                cmd = {'play': b'pause 1\n', 'pause': b'pause 0\n'}.get(touch_state['state'], b'play\n')
+                sock.sendall(cmd)
+                reply = mpd_read_lines(reader)
+                print(f'MPD {cmd.decode().strip()}: {reply}', flush=True)
+            finally:
+                sock.close()
+        elif source:
+            action = 'pause' if playing else 'play'
+            result = subprocess.run(['/usr/local/bin/soloist', 'ctl', action],
+                                    timeout=8, check=False, capture_output=True, text=True)
+            print(f'soloist ctl {action}: rc={result.returncode} '
+                  f'{(result.stdout + result.stderr).strip()[:120]}', flush=True)
+        else:
+            print('Button tap ignored: no active source', flush=True)
+    except Exception as exc:
+        print(f'Play/pause failed: {exc}', flush=True)
+    wake.set()
+
+
+def _ioc(direction, nr, size):
+    return (direction << 30) | (size << 16) | (0xB4 << 8) | nr
+
+
+GPIO_GET_LINEHANDLE = _ioc(3, 3, 364)
+GPIOHANDLE_GET_VALUES = _ioc(3, 8, 64)
+GPIOHANDLE_SET_VALUES = _ioc(3, 9, 64)
+SPI_IOC_WR_MODE = 0x40016B01
+SPI_IOC_WR_MAX_SPEED = 0x40046B04
+SPI_IOC_MESSAGE_1 = 0x40206B00
+
+
+class TouchPanel:
+    """XPT2046/ADS7846 on /dev/spidev0.1, chip select and pen IRQ as plain GPIOs.
+
+    The kernel ads7846 driver cannot be used: the pen IRQ (PI20, header pin 11)
+    has no interrupt function on this SoC, so the pen line is polled."""
+
+    def __init__(self, tcfg):
+        self.chip = os.open(tcfg.get('gpiochip', '/dev/gpiochip0'), os.O_RDWR | os.O_CLOEXEC)
+        self.cs = self._handle(int(tcfg.get('cs_line', 248)), 0x2, 1)    # PH24, output, idle high
+        self.pen = self._handle(int(tcfg.get('pen_line', 276)), 0x1)     # PI20, input
+        self.spi = os.open(tcfg.get('spidev', '/dev/spidev0.1'), os.O_RDWR | os.O_CLOEXEC)
+        fcntl.ioctl(self.spi, SPI_IOC_WR_MODE, struct.pack('B', 0))
+        fcntl.ioctl(self.spi, SPI_IOC_WR_MAX_SPEED, struct.pack('I', 2000000))
+        self._tx = ctypes.create_string_buffer(3)
+        self._rx = ctypes.create_string_buffer(3)
+        self._msg = struct.pack('<QQIIHBBBBH', ctypes.addressof(self._tx), ctypes.addressof(self._rx),
+                                3, 2000000, 0, 8, 0, 0, 0, 0)
+
+    def _handle(self, line, flags, default=0):
+        req = (struct.pack('<64I', line, *([0] * 63)) + struct.pack('<I', flags)
+               + bytes([default]) + bytes(63) + b'music-display'.ljust(32, b'\0')
+               + struct.pack('<I', 1) + struct.pack('<i', 0))
+        buf = bytearray(req)
+        fcntl.ioctl(self.chip, GPIO_GET_LINEHANDLE, buf, True)
+        return struct.unpack_from('<i', buf, 360)[0]
+
+    def pen_down(self):
+        buf = bytearray(64)
+        fcntl.ioctl(self.pen, GPIOHANDLE_GET_VALUES, buf, True)
+        return buf[0] == 0                       # pen IRQ is active low
+
+    def _read(self, command):
+        self._tx.raw = bytes([command, 0, 0])
+        fcntl.ioctl(self.cs, GPIOHANDLE_SET_VALUES, bytearray(64), True)           # CS low
+        try:
+            fcntl.ioctl(self.spi, SPI_IOC_MESSAGE_1, self._msg)
+        finally:
+            fcntl.ioctl(self.cs, GPIOHANDLE_SET_VALUES, bytearray([1]) + bytearray(63), True)
+        return (((self._rx.raw[1] << 8) | self._rx.raw[2]) >> 3) & 0xFFF
+
+    def sample(self):
+        """One settled (x, y) raw reading, median of a few conversions."""
+        xs, ys = [], []
+        self._read(0xD0)                         # discard: channel settling
+        for _ in range(5):
+            xs.append(self._read(0xD0))
+            ys.append(self._read(0x90))
+        xs.sort()
+        ys.sort()
+        return xs[2], ys[2]
+
+
+def touch_thread(cfg):
+    """Poll the touch panel and fire a tap on the button when the finger lifts."""
+    tcfg = cfg.get('touch', {})
+    if not tcfg.get('enabled', True):
+        return
+    swap = bool(tcfg.get('swap_xy', True))
+    inv_x, inv_y = bool(tcfg.get('invert_x', False)), bool(tcfg.get('invert_y', False))
+    x_min, x_max = float(tcfg.get('x_min', 0)), float(tcfg.get('x_max', 4095))
+    y_min, y_max = float(tcfg.get('y_min', 0)), float(tcfg.get('y_max', 4095))
+    debug = bool(tcfg.get('debug'))
+    while True:
+        try:
+            panel = TouchPanel(tcfg)
+            print('Touch panel ready (spidev, polled pen IRQ)', flush=True)
+            last = None
+            down_samples = 0
+            while True:
+                if panel.pen_down():
+                    raw = panel.sample()
+                    if panel.pen_down():             # still down: reading is valid
+                        last = raw
+                        down_samples += 1
+                    time.sleep(0.01)
+                    continue
+                if last is not None and down_samples >= 2:
+                    rx, ry = last
+                    if swap:
+                        rx, ry = ry, rx
+                        lo_x, hi_x, lo_y, hi_y = y_min, y_max, x_min, x_max
+                    else:
+                        lo_x, hi_x, lo_y, hi_y = x_min, x_max, y_min, y_max
+                    fx = min(1.0, max(0.0, (rx - lo_x) / (hi_x - lo_x)))
+                    fy = min(1.0, max(0.0, (ry - lo_y) / (hi_y - lo_y)))
+                    px = (1 - fx if inv_x else fx) * WIDTH
+                    py = (1 - fy if inv_y else fy) * HEIGHT
+                    if debug:
+                        print(f'Touch raw={last} -> {px:.0f},{py:.0f}', flush=True)
+                    if (touch_state['visible'] and abs(px - BTN_CX) <= BTN_HIT
+                            and abs(py - BTN_CY) <= BTN_HIT):
+                        toggle_playback(cfg)
+                last, down_samples = None, 0
+                time.sleep(0.03)
+        except Exception as exc:
+            print(f'Touch reader error: {exc}', flush=True)
+        time.sleep(10)
+
+
 def fmt_time(seconds):
     seconds = max(0, int(seconds or 0))
     return f'{seconds // 60}:{seconds % 60:02d}'
@@ -627,6 +774,13 @@ def render(snapshot, art, now):
         fill_w = int((right - left) * min(1.0, position / duration))
         if fill_w > 0:
             d.rounded_rectangle((left, bar_y, left + fill_w, bar_y + 5), radius=3, fill='#70D0B2')
+    # Play / pause touch button (right, above the timeline)
+    d.ellipse((BTN_CX - BTN_R, BTN_CY - BTN_R, BTN_CX + BTN_R, BTN_CY + BTN_R), fill='#18352F', outline='#70D0B2', width=2)
+    if state == 'play':
+        d.rectangle((BTN_CX - 8, BTN_CY - 9, BTN_CX - 3, BTN_CY + 9), fill='#8DE0C2')
+        d.rectangle((BTN_CX + 3, BTN_CY - 9, BTN_CX + 8, BTN_CY + 9), fill='#8DE0C2')
+    else:
+        d.polygon([(BTN_CX - 6, BTN_CY - 10), (BTN_CX - 6, BTN_CY + 10), (BTN_CX + 10, BTN_CY)], fill='#8DE0C2')
     d.text((16, 290), fmt_time(position), font=f_time, fill='#B7C3CF')
     end = fmt_time(duration) if duration else '--:--'
     end_w = d.textbbox((0, 0), end, font=f_time)[2]
@@ -649,6 +803,7 @@ def main():
     idle_vx, idle_vy = 42.0, 30.0
     idle_last_frame = 0.0
     running = True
+    threading.Thread(target=touch_thread, args=(cfg,), daemon=True).start()
 
     def stop_signal(_sig, _frame):
         nonlocal running
@@ -670,6 +825,7 @@ def main():
                 last_key = key
 
             state = str(snapshot.get('state', 'stop')).lower()
+            touch_state.update(source=str(snapshot.get('source') or '').lower(), state=state, visible=False)
 
             # Start the idle timer when playback enters stopped state.
             if state in ('stop', 'pause'):
@@ -734,7 +890,7 @@ def main():
                         idle_last_frame = now
 
                     elapsed = time.monotonic() - started
-                    time.sleep(max(0.05, poll - elapsed))
+                    wake.wait(max(0.05, poll - elapsed)); wake.clear()
                     continue
             else:
                 idle_since = None
@@ -747,6 +903,7 @@ def main():
                     last_render_key = None
                     print('Display resumed', flush=True)
 
+            touch_state['visible'] = True
             position_bucket = int(float(snapshot.get('position') or 0)) if state == 'play' else None
             render_key = (
                 snapshot.get('track_key'), state, snapshot.get('source'),
@@ -760,7 +917,7 @@ def main():
                 last_render_key = render_key
 
             elapsed = time.monotonic() - started
-            time.sleep(max(0.05, poll - elapsed))
+            wake.wait(max(0.05, poll - elapsed)); wake.clear()
     finally:
         fb.close()
 
