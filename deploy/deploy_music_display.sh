@@ -137,6 +137,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 CONFIG_PATH = Path('/etc/music-display/config.json')
 STATE_PATH = Path('/var/lib/music-display/spotify.json')
 CACHE_DIR = Path('/var/cache/music-display')
+SOLOIST_DATA_DIR = '/var/lib/soloist'   # same data dir as soloist.service / streamer-soloist-event
 WIDTH, HEIGHT = 480, 320
 FBIOGET_VSCREENINFO = 0x4600
 FBIOGET_FSCREENINFO = 0x4602
@@ -586,7 +587,7 @@ def toggle_playback(cfg):
                 sock.close()
         elif source:
             action = 'pause' if playing else 'play'
-            result = subprocess.run(['/usr/local/bin/soloist', 'ctl', action],
+            result = subprocess.run(['/usr/local/bin/soloist', 'ctl', '-D', SOLOIST_DATA_DIR, action],
                                     timeout=8, check=False, capture_output=True, text=True)
             print(f'soloist ctl {action}: rc={result.returncode} '
                   f'{(result.stdout + result.stderr).strip()[:120]}', flush=True)
