@@ -1,0 +1,50 @@
+#!/bin/bash
+# Publish Soloist's Spotify Connect (zeroconf) service through avahi.
+#
+# Soloist advertises itself over mDNS with the address of the last network
+# interface it sees; with WireGuard (wg0, 10.x, unreachable from the LAN) up,
+# that is the WireGuard address, so phones on the LAN cannot reach the device
+# for pairing/login. avahi advertises only multicast-capable LAN interfaces,
+# so this adds a correct record next to Soloist's own. Soloist's TCP port
+# changes on every start, hence this runs after each (re)start.
+#   streamer-soloist-mdns up    (ExecStartPost) write the avahi service file
+#   streamer-soloist-mdns down  (ExecStopPost)  remove it
+set -u
+F=/etc/avahi/services/spotify-connect-lan.service
+case "${1:-}" in
+down) rm -f "$F"; exit 0 ;;
+up) ;;
+*) echo "usage: $0 up|down" >&2; exit 2 ;;
+esac
+
+pid="$(systemctl show -p MainPID --value soloist)"
+name="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | sed -n 's/.* -n \([^ ]*\) .*/\1/p')"
+port=""
+for _ in $(seq 1 40); do
+    port="$(ss -tlnpH 2>/dev/null | awk -v p="pid=$pid," '$0 ~ p && $4 !~ /^127\./ {n=split($4,a,":"); print a[n]; exit}')"
+    [ -n "$port" ] && break
+    sleep 0.5
+done
+if [ -z "$port" ] || [ -z "$name" ]; then
+    logger -t streamer-soloist-mdns "no soloist zeroconf port/name found (port='$port' name='$name')"
+    exit 0
+fi
+cat > "$F.tmp" 2>/dev/null <<XML
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<service-group>
+  <name>$name</name>
+  <service>
+    <type>_spotify-connect._tcp</type>
+    <port>$port</port>
+    <txt-record>Stack=SP</txt-record>
+    <txt-record>VERSION=1.0</txt-record>
+    <txt-record>CPath=/zc</txt-record>
+  </service>
+</service-group>
+XML
+if mv "$F.tmp" "$F"; then
+    logger -t streamer-soloist-mdns "published $name on port $port via avahi"
+else
+    logger -t streamer-soloist-mdns "failed to write $F"
+fi

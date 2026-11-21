@@ -105,6 +105,7 @@ Soloist builds expire 90 days after their build date (exit code 10). `streamer-s
 | `systemd/streamer-pulseaudio.service` | `/etc/systemd/system/` | Runs PulseAudio in system mode (root, group audio) after the audio-default scan; restarted on card switch |
 | `systemd/soloist.service` | `/etc/systemd/system/` | Runs Soloist as user `soloist`, name "BPi-M2U-Streamer", data dir `/var/lib/soloist`, 1 GB cache, initial volume 80%, WebSocket API on 127.0.0.1:8934; clears the MPD-paused flag on start |
 | `bin/streamer-soloist-event`<br>`systemd/streamer-soloist-event.service` | `/usr/local/bin/`<br>`/etc/systemd/system/` | Spotify priority (pause/resume MPD) and display state file `/var/lib/music-display/spotify.json` |
+| `bin/streamer-soloist-mdns`<br>`systemd/soloist.service.d/10-mdns-lan.conf` | `/usr/local/bin/`<br>`/etc/systemd/system/soloist.service.d/` | Publishes Soloist's Spotify Connect service via avahi with the LAN addresses (Soloist itself advertises the WireGuard address, so phones could not find it for pairing); rewritten on every Soloist start |
 | `bin/streamer-soloist-update.sh`<br>`systemd/streamer-soloist-update.{service,timer}` | `/usr/local/bin/`<br>`/etc/systemd/system/` | Weekly Soloist re-download from soloist-builds.spotifycdn.com |
 | `default/streamer-audio` | `/etc/default/streamer-audio` | `PCM_VOLUME` (DAC volume applied on card activation, default 60) |
 | `bin/streamer-audio-default.sh` | `/usr/local/bin/` | Event-driven (`add <card>` / `remove` / `scan` all do the same): recompute the default card, update `/etc/asound.conf`, restart players once the target is openable |
@@ -160,6 +161,9 @@ mkdir -p /var/lib/soloist /var/cache/soloist \
 install -m755 bin/streamer-audio-default.sh /usr/local/bin/
 install -m755 bin/streamer-soloist-event /usr/local/bin/
 install -m755 bin/streamer-soloist-update.sh /usr/local/bin/
+install -m755 bin/streamer-soloist-mdns /usr/local/bin/
+install -Dm644 systemd/soloist.service.d/10-mdns-lan.conf \
+    /etc/systemd/system/soloist.service.d/10-mdns-lan.conf
 install -d -o soloist -g audio /var/lib/streamer
 cp pulse/system.pa pulse/daemon.conf /etc/pulse/
 cp mpd/mpd.conf /etc/mpd.conf
