@@ -26,6 +26,7 @@
 - [Spotify setup](#spotify-setup-one-time-per-controlling-account)
 - [Local music](#local-music)
 - [Display](#display)
+- [Power-off](#power-off)
 - [Operations cheat sheet](#operations-cheat-sheet)
 - [Verified working](#verified-working)
 
@@ -276,6 +277,12 @@ Default config:
 - Redraws happen only when something visible changes (position bucketed per second).
 - `music-display-boot-splash.service` shows the splash (top of this page) while the box boots. `install_bootsplash.sh` also sets a serial-only console, `quiet`, `systemd.show_status=false` and `udev.log_level=0` in `/boot/armbianEnv.txt`, so nothing but the splash appears on the panel.
 - A drop-in disables the console cursor blink on fbcon.
+
+## Power-off
+
+The box can simply be unplugged. The root filesystem is journaled ext4 (`/etc/fstab`: `commit=15`, so at most ~15 s of writes are at risk, and the journal is replayed on the next boot). `/var/log` lives in RAM (zram), so logs cost no eMMC writes. The music partition (vfat, no journal) is only written when the library database is updated or files are changed. Do not unplug during such a change. Playback and normal operation never write there.
+
+A clean shutdown is still available: a short press of the board's power button (axp20x-pek, systemd-logind default `HandlePowerKey=poweroff`) or `sudo poweroff`.
 
 ## Operations cheat sheet
 
