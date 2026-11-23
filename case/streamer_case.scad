@@ -17,7 +17,13 @@
 // down between window wall and rails and rests on the ledge) -> disk screwed
 // to the lid brackets, SATA cable plugged -> lid on.
 //
-// Render:  part = "base" | "lid" | "assembly" | "section"
+// Look ("hi-fi"): rounded vertical edges, the base stands on a set-in plinth
+// (45° undercut, so it seems to float), recessed front panel with the screen
+// on the left (plain on the right), the lid overhangs the panel
+// slightly, V-groove at the lid seam. Everything prints without supports:
+// base upright on its flat bottom, lid upside down.
+//
+// Render:  part = "base" | "lid" | "assembly" | "section" | "closed"
 
 part = "assembly";
 
@@ -29,6 +35,17 @@ wall    = 2.4;   // side walls
 floor_t = 2.0;   // floor thickness
 lid_t   = 2.4;   // lid thickness
 clr     = 0.3;   // fit clearance
+
+// ---------- look ----------
+corner_r     = 8;    // outer vertical edge radius
+in_corner_r  = 3;    // inner corner radius (keeps the display corner clear)
+plinth       = 3;    // 45° undercut at the bottom ("floating" base)
+rim_w        = 3;    // solid rim inside the wall bottom, carries the undercut
+rim_h        = 5;    // rim top (z)
+seam_c       = 0.8;  // chamfer on both sides of the lid seam -> V-groove
+top_c        = 1.0;  // chamfer on the lid top edge
+front_recess = 1.0;  // front panel recess depth
+panel_z0     = 6;    // front panel lower edge (open to the lid at the top)
 
 // ---------- board (from DXF) ----------
 board_w = 91.4;
@@ -67,11 +84,11 @@ disk_len  = 100.0;
 disk_w    = 69.85;
 disk_hmax = 9.5;          // 7 mm disks fit too (slotted holes)
 top_gap   = 3;            // disk top -> lid underside
-disk_x0   = -4.3;         // left end of the disk
+disk_x0   = -2.3;         // left end of the disk (2.5 mm from the left wall, clear of the lid lip)
 disk_y0   = 12;           // front side of the disk
 
 // ---------- cable space ----------
-cable_right = 50;         // right of the disk connector end
+cable_right = 48;         // right of the disk connector end
 cable_back  = 50;         // behind the board
 
 // ---------- derived inner box ----------
@@ -83,10 +100,11 @@ top_z   = disp_z0 + disp_h + 2;                  // wall top = lid underside
 disk_z0 = top_z - top_gap - disk_hmax;           // disk hangs right under the lid
 
 out_x0 = in_x0 - wall; out_x1 = in_x1 + wall;
-out_y0 = in_y0 - wall; out_y1 = in_y1 + wall;
+out_y0 = in_y0 - wall - front_recess; out_y1 = in_y1 + wall;   // front wall is thicker by the recess
+panel_y = out_y0 + front_recess;                               // front panel surface
 
 // lid screw bosses: [x, y]  (all full height)
-boss = 6;
+boss = 8;                 // 2.65 mm wall around the M3 pilot
 lid_screw_d = 2.7;        // pilot for M3 self-tapping
 bosses = [
   [in_x0 + boss/2,  disp_back_v + rail_t + 1 + boss/2],   // left wall, behind the display pocket
@@ -97,6 +115,17 @@ bosses = [
 
 // ---------------------------------------------------------------
 module rbox(p0, p1) translate(p0) cube(p1 - p0);
+
+module rrect(x0, y0, x1, y1, r) translate([x0 + r, y0 + r]) offset(r = r) square([x1 - x0 - 2*r, y1 - y0 - 2*r]);
+module outer2d() rrect(out_x0, out_y0, out_x1, out_y1, corner_r);
+module inner2d() rrect(in_x0, in_y0, in_x1, in_y1, in_corner_r);
+
+// convex slab from z0 to z1 with 45° chamfers cb (bottom) and ct (top)
+module cslab(z0, z1, cb, ct) hull() {
+  translate([0, 0, z0]) linear_extrude(eps) offset(r = -cb) children();
+  translate([0, 0, z0 + cb]) linear_extrude(z1 - z0 - cb - ct) children();
+  translate([0, 0, z1 - eps]) linear_extrude(eps) offset(r = -ct) children();
+}
 
 module slot2d(a, b, d) hull() { translate(a) circle(d = d); translate(b) circle(d = d); }
 
@@ -112,9 +141,9 @@ module disp_window() {
   z0 = disp_z0 + disp_border[2]; z1 = disp_z0 + disp_h - disp_border[3];
   rbox([x0, out_y0 - 1, z0], [x1, in_y0 + 1, z1]);
   hull() {
-    rbox([x0, out_y0 + win_chamfer, z0], [x1, out_y0 + win_chamfer + eps, z1]);
-    rbox([x0 - win_chamfer - 1, out_y0 - 1, z0 - win_chamfer - 1],
-         [x1 + win_chamfer + 1, out_y0 - 1 + eps, z1 + win_chamfer + 1]);
+    rbox([x0, panel_y + win_chamfer, z0], [x1, panel_y + win_chamfer + eps, z1]);
+    rbox([x0 - win_chamfer - 1, panel_y - 1, z0 - win_chamfer - 1],
+         [x1 + win_chamfer + 1, panel_y - 1 + eps, z1 + win_chamfer + 1]);
   }
 }
 
@@ -134,14 +163,19 @@ module disp_pocket() {
 }
 
 // ---------------- base ----------------
-module base() {
+module base() intersection() {
+  // outer body: plinth undercut at the bottom, seam chamfer at the top
+  cslab(0, top_z, plinth, seam_c) outer2d();
   difference() {
     union() {
       // shell
       difference() {
-        rbox([out_x0, out_y0, 0], [out_x1, out_y1, top_z]);
-        rbox([in_x0, in_y0, floor_t], [in_x1, in_y1, top_z + 1]);
+        translate([0, 0, 0]) linear_extrude(top_z) outer2d();
+        translate([0, 0, floor_t]) linear_extrude(top_z) inner2d();
       }
+      // solid rim at the wall foot (the plinth undercut cuts into it)
+      translate([0, 0, floor_t - eps]) linear_extrude(rim_h - floor_t + eps)
+        difference() { inner2d(); offset(r = -rim_w) inner2d(); }
       disp_pocket();
       // board standoffs
       for (h = board_holes) translate([h[0], h[1], floor_t - eps])
@@ -149,9 +183,6 @@ module base() {
       // lid bosses
       for (b = bosses) translate([b[0] - boss/2, b[1] - boss/2, floor_t - eps])
         cube([boss, boss, top_z - floor_t + eps]);
-      // feet
-      for (x = [out_x0 + 8, out_x1 - 8], y = [out_y0 + 8, out_y1 - 8])
-        translate([x, y, -3]) cylinder(d = 10, h = 3 + eps);
     }
     // board screw pilots
     for (h = board_holes) translate([h[0], h[1], 0.8]) cylinder(d = board_screw_d, h = 20);
@@ -159,15 +190,19 @@ module base() {
     for (b = bosses) translate([b[0], b[1], top_z - 12]) cylinder(d = lid_screw_d, h = 13);
 
     // left wall: USB, LAN, audio
-    for (c = [usb, lan])
-      rbox([out_x0 - 1, c[0][1] - 0.6, board_top - 0.6],
-           [in_x0 + 1, c[1][1] + 0.6, board_top + c[2] + 0.6]);
-    translate([out_x0 - 1, audio[0], board_top + audio[1]]) rotate([0, 90, 0])
-      cylinder(d = audio[2], h = wall + 2);
+    // audio + USB share one opening (a separate audio hole left a 0.75 mm web;
+    // the wider opening also lets thicker plug housings reach the recessed jack)
+    rbox([out_x0 - 1, audio[0] - audio[2]/2, min(board_top - 0.6, board_top + audio[1] - audio[2]/2)],
+         [in_x0 + 1, usb[1][1] + 0.6, board_top + usb[2] + 0.6]);
+    rbox([out_x0 - 1, lan[0][1] - 0.6, board_top - 0.6],
+         [in_x0 + 1, lan[1][1] + 0.6, board_top + lan[2] + 0.6]);
 
-    // front wall: display window, IR window
+    // front: recessed panel (open at the top, the lid overhangs it), display
+    // window, IR window (pill)
+    rbox([out_x0 + corner_r, out_y0 - 1, panel_z0], [out_x1 - corner_r, panel_y, top_z + 1]);
     disp_window();
-    rbox([ir[0] - 6, out_y0 - 1, board_top - 1], [ir[0] + 6, in_y0 + 1, board_top + 8]);
+    hull() for (x = [ir[0] - 1.5, ir[0] + 1.5])
+      translate([x, out_y0 - 1, board_top + 3.5]) rotate([-90, 0, 0]) cylinder(d = 9, h = in_y0 - out_y0 + 2);
 
     // floor vents under the CPU / board centre (intake)
     translate([0, 0, -1]) linear_extrude(floor_t + 2) vents(22, 14, 40, 9, 4);
@@ -188,12 +223,12 @@ br_t = 3;   // disk bracket thickness
 module lid() {
   difference() {
     union() {
-      // plate
-      rbox([out_x0, out_y0, top_z], [out_x1, out_y1, top_z + lid_t]);
+      // plate (seam chamfer below, edge chamfer on top)
+      cslab(top_z, top_z + lid_t, seam_c, top_c) outer2d();
       // locating lip
       difference() {
-        rbox([in_x0 + clr, in_y0 + clr, top_z - 3], [in_x1 - clr, in_y1 - clr, top_z + eps]);
-        rbox([in_x0 + clr + 1.6, in_y0 + clr + 1.6, top_z - 4], [in_x1 - clr - 1.6, in_y1 - clr - 1.6, top_z + 1]);
+        translate([0, 0, top_z - 3]) linear_extrude(3 + eps)
+          difference() { offset(r = -clr) inner2d(); offset(r = -clr - 1.6) inner2d(); }
         for (b = bosses) rbox([b[0] - boss/2 - clr, b[1] - boss/2 - clr, top_z - 4],
                               [b[0] + boss/2 + clr, b[1] + boss/2 + clr, top_z + 1]);
         // display pocket rails reach the top
@@ -219,7 +254,7 @@ module lid() {
     // vents over the cable area and behind the disk
     translate([0, 0, top_z - 4]) linear_extrude(lid_t + 5) {
       vents(disk_x0 + disk_len + 8, 8, 34, 24, 4);
-      vents(4, disk_y0 + disk_w + 8, 80, 5, 4);
+      vents(7, disk_y0 + disk_w + 8, 80, 5, 4);
     }
   }
 }
@@ -247,11 +282,16 @@ else if (part == "section") intersection() {   // cut at X = 50, seen from the l
   rbox([50, -100, -10], [300, 300, 200]);
   union() { color("orange") base(); color("gold") lid(); board_dummy(); disk_dummy(); display_dummy(); }
 }
+else if (part == "closed") {   // finished look
+  color([0.42, 0.43, 0.46]) { base(); lid(); }
+  color([0.15, 0.35, 0.75]) rbox([disp_x0 + 0.5, disp_back_v - disp_t, disp_z0 + 0.5], [disp_x0 + disp_w - 0.5, disp_back_v, disp_z0 + disp_h - 0.5]);
+}
 else {
   color("orange", 0.55) base();
   color("gold", 0.45) translate([0, 0, 25]) lid();   // lifted for visibility
   board_dummy(); disk_dummy(); display_dummy();
 }
 
-echo(str("outer size: ", out_x1 - out_x0, " x ", out_y1 - out_y0, " x ", top_z + lid_t, " mm (+3 mm feet)"));
+echo(str("outer size: ", out_x1 - out_x0, " x ", out_y1 - out_y0, " x ", top_z + lid_t, " mm (flat bottom: use stick-on rubber feet)"));
+echo(str("print bed footprint: base ", out_x1 - out_x0 - 2 * plinth, " x ", out_y1 - out_y0 - 2 * plinth, ", lid ", out_x1 - out_x0 - 2 * top_c, " x ", out_y1 - out_y0 - 2 * top_c));
 echo(str("board top z=", board_top, "  disk bottom z=", disk_z0, "  display z=", disp_z0, "..", disp_z0 + disp_h));
